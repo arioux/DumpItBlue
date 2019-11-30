@@ -1,0 +1,3287 @@
+#!/usr/bin/perl
+# Perl - v: 5.16.3
+#------------------------------------------------------------------------------#
+# DumpItBlue-Process.plw  : DumpItBlue process for Dump functions
+# WebSite                 : http://le-tools.com/DumpItBlue.html
+# Documentation           : http://le-tools.com/DumpItBlueDoc.html
+# SourceForge             : https://sourceforge.net/p/dumpitblue
+# GitHub                  : https://github.com/arioux/DumpItBlue
+# Creation                : 2015-08-01
+# Modified                : 2019-05-26
+my $VERSION               = '7.0.2';
+# Author                  : Alain Rioux (admin@le-tools.com)
+#
+# Copyright (C) 2015-2018  Alain Rioux (le-tools.com)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#------------------------------------------------------------------------------#
+
+#------------------------------------------------------------------------------#
+# Modules
+#------------------------------------------------------------------------------#
+use strict;
+use warnings;
+use threads;
+use threads::shared;
+use utf8;
+use arybase;
+use Encode qw(encode decode);
+use DBI;
+use Time::Local;
+use Time::HiRes qw(usleep);
+use DateTime;
+use DateTime::Format::Strptime;
+use Excel::Writer::XLSX;
+use File::Copy::Recursive qw(rcopy);
+use File::Path qw(remove_tree);
+use URI::Escape::JavaScript qw(unescape);
+use HTML::DOM;
+use HTML::Entities;
+use Log::Log4perl qw(:easy);
+use Future::HTTP::Tiny;
+use Chrome::DevToolsProtocol::Transport::AnyEvent;
+use WWW::Mechanize::Chrome;
+use Image::Info qw(image_info dim);
+use Win32::API();
+use Win32::GUI();
+use Win32::GUI qw( WS_POPUP WS_CAPTION WS_THICKFRAME WS_EX_TOPMOST );
+use Win32::GUI::BitmapInline();
+use Win32::Process;
+require "DumpItBlue-LoadGraph.pl";
+require "DumpItBlueLang.pl";
+
+#------------------------------------------------------------------------------#
+# Global variables
+#------------------------------------------------------------------------------#
+my $REF_ARG     = \@ARGV;                                                      # Parameters
+my $PROCNAME    = $$REF_ARG[0];                                                # Process Name (ex.: DumpAlbums)
+my $PROCID      = $$REF_ARG[1];                                                # Process ID
+my $PROGDIR     = $$REF_ARG[2];                                                # Program directory
+my $USERDIR     = $$REF_ARG[3];                                                # User path
+my $LANG_FILE   = "$USERDIR\\Lang.ini";                                        # Langage file
+my $DEBUG_FILE  = "$USERDIR\\debug.log";                                			 # Log for error
+my %STR;                                                                       # Strings for GUI
+my $ARROW       :shared;                                                       # Arrow pointer
+my $HOURGLASS   :shared;                                                       # Hourglass pointer
+my $THR;                                                                       # Thread
+
+#------------------------------------------------------------------------------#
+# Graphic elements
+#------------------------------------------------------------------------------#
+my ($winICO, $logoBmp, $albumBmp, $friendsBmp, $contribBmp, $browseBmp, $explorerBmp,
+    $refresh16) = &loadGraph();
+
+#------------------------------------------------------------------------------#
+# Strings
+#------------------------------------------------------------------------------#
+&loadDefaultStr(\%STR); 																											 # Load default language (en)
+&loadStr(\%STR, $LANG_FILE) if -e $LANG_FILE and -T $LANG_FILE; 							 # If language file, load translated strings
+
+#------------------------------------------------------------------------------#
+# Windows utils
+#------------------------------------------------------------------------------#
+my $screen = Win32::GUI::GetDesktopWindow(); # Screen resolution
+my $scrnX  = Win32::GUI::Width($screen);
+my $scrnY  = Win32::GUI::Height($screen);
+# Fonts
+sub LOGPIXELSX() {88}
+sub getDPI { return(Win32::GUI::DC->new()->GetDeviceCaps(LOGPIXELSX)); }
+my $DPI = &getDPI();
+my $fontGB;
+my $fontGB2;
+my $font8;
+my $font10;
+my $font10t;
+# Larger size (125% and 150%)
+if ($DPI >= 120) {
+  $fontGB  = new Win32::GUI::Font(-name => 'Arial', -size => 10, -bold => 1);
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 10, -bold => 1, -underline => 1);
+  $font8   = new Win32::GUI::Font(-name => 'Arial', -size =>  6);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size =>  8);
+  $font10t = new Win32::GUI::Font(-name => 'Arial', -size =>  8, -underline => 1);
+# Normal size
+} else {
+  $fontGB  = new Win32::GUI::Font(-name => 'Arial', -size => 12, -bold => 1);
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 12, -bold => 1, -underline => 1);
+  $font8   = new Win32::GUI::Font(-name => 'Arial', -size =>  8);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size => 10);
+  $font10t = new Win32::GUI::Font(-name => 'Arial', -size => 10, -underline => 1);
+}
+# Load Pointers
+my $loadImage = new Win32::API('user32', 'LoadImage', ['N','N','I','I','I','I'],'N');
+$HOURGLASS    = $loadImage->Call(0, 32514, 2, 0, 0, 0x8040);
+$ARROW        = $loadImage->Call(0, 32512, 2, 0, 0, 0x8040);
+# Logo
+my $WIN_LOGO;
+if    ($PROCNAME eq 'DumpAlbums'       ) { $WIN_LOGO = $albumBmp;   }
+elsif ($PROCNAME eq 'DumpFriends'      ) { $WIN_LOGO = $friendsBmp; }
+elsif ($PROCNAME eq 'DumpMutualFriends') { $WIN_LOGO = $friendsBmp; }
+elsif ($PROCNAME eq 'DumpContrib'      ) { $WIN_LOGO = $friendsBmp; }
+elsif ($PROCNAME eq 'DumpComments'     ) { $WIN_LOGO = $contribBmp; }
+elsif ($PROCNAME eq 'DumpGroupMembers' ) { $WIN_LOGO = $friendsBmp; }
+
+#------------------------------------------------------------------------------#
+# Progress window
+#------------------------------------------------------------------------------#
+my $winWidth  = 740;
+my $winHeight = 180;
+my $winPosX   = ($scrnX - $winWidth)  / 2;
+my $winPosY   = ($scrnY - $winHeight) / 2;
+my $winPb = Win32::GUI::DialogBox->new( -name        => 'winPb'                ,
+                                        -text        => $STR{'Progress'}       ,
+                                        -pos         => [$winPosX, $winPosY]	 ,
+                                        -size        => [$winWidth, $winHeight],
+                                        -background  => [255, 255, 255]        ,
+                                        -hasmaximize => 0                      ,
+                                        -hasminimize => 1                      ,
+                                        -helpbutton  => 0                      ,
+                                        -resizable   => 0                      ,
+                                        -topmost     => 1                      ,
+                                        -dialogui    => 1                      , );
+$winPb->SetIcon($winICO);
+$winPb->AddLabel(       -name        => 'lblLogo'        ,
+                        -size        => [128,128]        ,
+                        -pos         => [  0, 10]        ,
+                        -bitmap      => $WIN_LOGO        ,
+                        -background  => [255, 255, 255]  , );
+$winPb->AddLabel(       -name        => 'lblPbCurr1'     ,
+                        -size        => [578, 22]        ,
+                        -pos         => [140,  8]        ,
+                        -font        => $font10          ,
+                        -truncate    => 1                ,
+                        -background  => [255, 255, 255]  ,
+                        -foreground  => [  0,   0, 102]  , );
+$winPb->AddProgressBar( -name        => 'pbWinPb1'       ,
+                        -size        => [470, 22]        ,
+                        -pos         => [140, 32]        ,
+                        -smooth      => 1                , );
+$winPb->AddLabel(       -name        => 'lblCount1'      ,
+                        -size        => [100, 22]        ,
+                        -pos         => [620, 33]        ,
+                        -font        => $font10          ,
+                        -truncate    => 1                ,
+                        -background  => [255, 255, 255]  ,
+                        -foreground  => [  0,   0, 102]  , );
+$winPb->AddLabel(       -name        => 'lblPbCurr2'     ,
+                        -size        => [578, 22]        ,
+                        -pos         => [140, 60]        ,
+                        -font        => $font10          ,
+                        -truncate    => 1                ,
+                        -background  => [255, 255, 255]  ,
+                        -foreground  => [  0,   0, 102]  , );
+$winPb->AddProgressBar( -name        => 'pbWinPb2'       ,
+                        -size        => [470, 22]        ,
+                        -pos         => [140, 84]        ,
+                        -smooth      => 1                , );
+$winPb->AddLabel(       -name        => 'lblCount2'      ,
+                        -size        => [100, 22]        ,
+                        -pos         => [620, 85]        ,
+                        -font        => $font10          ,
+                        -truncate    => 1                ,
+                        -background  => [255, 255, 255]  ,
+                        -foreground  => [  0,   0, 102]  , );
+$winPb->AddButton(      -name        => 'btnCancel'      ,
+                        -text        => $STR{'Cancel'}   ,
+                        -font        => $font10          ,
+                        -size        => [ 80, 30]        ,
+                        -pos         => [330,115]        ,
+                        -cancel      => 1                , );
+
+#------------------------------------------------------------------------------#
+# Splash window
+#------------------------------------------------------------------------------#
+my $splash = new Win32::GUI::Window ( -name       => 'Splash'                  ,
+                                      -text       => 'Splash'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [100,100]                 ,
+                                      -addstyle   => WS_POPUP                  ,
+                                      -popstyle   => WS_CAPTION | WS_THICKFRAME,
+                                      -addexstyle => WS_EX_TOPMOST             , );
+$splash->AddLabel(                    -name       => 'Bitmap'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [  0,  0]                 ,
+                                      -bitmap     => $WIN_LOGO                 , );
+
+#------------------------------------------------------------------------------#
+# Execute process
+#------------------------------------------------------------------------------#
+my $dbFile  = "$USERDIR\\Queue\\$PROCNAME-$PROCID\.db";
+my $dsn     = "DBI:SQLite:dbname=$dbFile";
+if (-f $dbFile and my $dbh = DBI->connect($dsn, undef, undef, { sqlite_unicode => 1 })) {
+  # Center the splash and show it
+  $splash->Center();
+  $splash->Show();
+  Win32::GUI::DoEvents();
+  # Get current infos
+  my $refInfos;
+  my $allInfos = $dbh->selectall_arrayref("SELECT key,value FROM INFOS");
+  foreach (@$allInfos) { $$refInfos{$$_[0]} = $$_[1]; }
+  $dbh->disconnect;
+  # Show progress window
+  $winPb->Center();
+  if ($$refInfos{silentProgress}) { $winPb->Show(2); }
+  else                            { $winPb->Show();  }
+  eval { my $mech = WWW::Mechanize::Chrome->new(tab => 'current'); };
+  if ($@) {
+    my $msgErr = $@;
+    chomp($msgErr);
+    $msgErr =~ s/[\t\r\n]/ /g;
+    &debug($msgErr) if $$refInfos{debugLogging};
+    Win32::GUI::MessageBox($winPb, $STR{'errChrome'}, $STR{'Error'}, 0x40010);
+    exit(0);
+  }
+  Win32::GUI::DoEvents();
+  # Hide Splash 
+  $splash->Hide;
+  # Start the thread
+  $THR = threads->create(sub {
+    my $refDbh;
+    # Thread 'die' signal handler
+    $SIG{__DIE__} = sub {
+      my $msgErr = $_[0];
+      # Ignore some errors
+      return if ($msgErr =~ /Future\/HTTP\/Tiny\/threaded\.pm/ or $msgErr =~ /\&Errno\:\:(?:EBADMSG|EPROTO)/ or $msgErr =~ /does not map to iso-8859-1/ or
+                 $msgErr =~ /content must be bytes at/ or $msgErr =~ /No node with given id found/ or $msgErr =~ /Could not find node with given id/ or
+                 $msgErr =~ /Node has gone away in the meantime/ or $msgErr =~ /Cannot decode string with wide characters/);
+      chomp($msgErr);
+      $msgErr =~ s/[\t\r\n]/ /g;
+      &debug($msgErr) if $$refInfos{debugLogging};
+      undef $$refDbh;
+      $winPb->ChangeCursor($ARROW);
+      # Progress window
+      $winPb->pbWinPb2->SetPos(0);
+      $winPb->lblPbCurr2->Text('');
+      $winPb->lblCount2->Text('');
+      my $err = (split(/ at /, $msgErr))[0];
+      Win32::GUI::MessageBox($winPb, "$STR{'processCrash'}: $err", $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+      exit(0); # Exit program
+    };
+    $winPb->ChangeCursor($HOURGLASS);
+    # Connect to database
+    my $dsn  = "DBI:SQLite:dbname=$dbFile";
+    $$refDbh = DBI->connect($dsn, undef, undef, { AutoCommit => 0, sqlite_unicode => 1 });
+    # Initiate Chrome connection
+    my $mech = WWW::Mechanize::Chrome->new(tab => 'current');
+    # Select appropriate function
+    if    ($PROCNAME eq 'DumpAlbums'       ) { &dumpAlbums(       \$mech, $refDbh, $dbFile, $refInfos); }
+    elsif ($PROCNAME eq 'DumpFriends'      ) { &dumpFriends(      \$mech, $refDbh, $dbFile, $refInfos); }
+    elsif ($PROCNAME eq 'DumpMutualFriends') { &dumpMutualFriends(\$mech, $refDbh, $dbFile, $refInfos); }
+    elsif ($PROCNAME eq 'DumpContrib'      ) { &dumpContrib(      \$mech, $refDbh, $dbFile, $refInfos); }
+    elsif ($PROCNAME eq 'DumpComments'     ) { &dumpComments(     \$mech, $refDbh, $dbFile, $refInfos); }
+    elsif ($PROCNAME eq 'DumpGroupMembers' ) { &dumpGroupMembers( \$mech, $refDbh, $dbFile, $refInfos); }
+    undef $$refDbh;
+    unlink($dbFile);
+    exit(0);
+  });
+  # Start GUI
+  Win32::GUI::Dialog();
+} else {
+  Win32::GUI::MessageBox($winPb, $STR{'warn1'}, $STR{'Error'}, 0x40010);
+  exit(0);
+}
+
+#--------------------------#
+sub dumpAlbums
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos, $nbrRetries, $firstExec) = @_;
+  # Number of album
+  my $refAllAlbums = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+  my $nbrAlbums    = scalar(@$refAllAlbums);
+  my $count1       = 0;
+  # Turn on progress bar
+  $winPb->pbWinPb1->SetRange(0, $nbrAlbums);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  &createPicturesDB($refDbh); # Create tables PICTURES
+  $winPb->Text("$STR{'Dump'} $STR{'Albums'} $STR{'inProgress'}...");
+  # Process each album
+  foreach my $entry (@$refAllAlbums) {
+    # $$refInfos{pageType}: 0 = unknown, 1 = People, 2 = Groups, 3 = Pages (Business)
+    # $$entry: 0 = Album id, 1 = name, 2 = url, 3 = tmpPage, 4 = path, 5 = step
+    my $encodedName     = encode($$refInfos{charSet}, $$entry[1]);
+    $winPb->lblPbCurr1->Text("$STR{'Processing'}: $encodedName");
+    my $sthUpdAlbumStep = $$refDbh->prepare('UPDATE ALBUMS SET step = ? WHERE id = ?');
+    my $albumStep       = $$entry[5];
+    # Steps:
+    # 1: Open the album page
+    # 2: Scroll the album page
+    # 3: Save the album page
+    # 4: Parse the album page
+    # 5: Browse the picture pages (if include publication date, large size picture and/or video have been selected)
+    # 6: Download the files
+    
+    # Open the album page
+    if (!$albumStep) {
+      $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}...");
+      $winPb->lblCount2->Text('');
+      $winPb->pbWinPb2->SetPos(0);
+      # Gather album page
+      $$refMech->get($$entry[2]);
+      sleep($$refInfos{timeToWait});
+      $albumStep = 1;
+      $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+      $$refDbh->commit();
+    }
+    # Scroll the album page
+    if ($albumStep == 1) {
+      $winPb->lblPbCurr2->Text("$STR{'Scrolling'} $STR{'thePage'}...");
+      if ($$refInfos{pageType} == 1) { &scrollFriendPage($refMech, $$refInfos{timeToWait}); }
+      else                           { &scrollPage($refMech, $$refInfos{'timeToWait'});     }
+      $albumStep = 2;
+      $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+      $$refDbh->commit();
+    }
+    # Save the album page
+    if ($albumStep == 2 or !$$entry[3] or !-T $$entry[3]) {
+      $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}...");
+      # Create the directories
+      mkdir("$$refInfos{saveDir}\\$$refInfos{filename}")
+      if !-d "$$refInfos{saveDir}\\$$refInfos{filename}"; # Base directory
+      my $albumDirName = $encodedName =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/gr;
+      my $albumsPath   = "$$refInfos{saveDir}\\$$refInfos{filename}\\$albumDirName";
+      mkdir($albumsPath) if !-d $albumsPath; # Directory for album
+      mkdir($albumsPath.'\temp') if !-d $albumsPath.'\temp'; # Temp directory for album
+      # Save the current tab in a temp file
+      my $albumsTmpPage = $albumsPath.'\temp\album_'.$$entry[0].'.html';
+      open(my $fhCurr, ">:encoding(utf8)", $albumsTmpPage);
+      print $fhCurr $$refMech->content;
+      close($fhCurr);
+      # Update Albums
+      my $sthUpdAlbum = $$refDbh->prepare('UPDATE ALBUMS SET tmpPage = ?, path = ? WHERE id = ?');
+      $sthUpdAlbum->execute($albumsTmpPage, $albumsPath, $$entry[0]);
+      $albumStep = 3;
+      $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+      $$refDbh->commit();
+    }
+    # Parse the album page
+    if ($albumStep == 3) {
+      $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}...");
+      &parseAlbumPage($refMech, $refDbh, $refInfos, $$entry[0]);
+      $albumStep = 4;
+      $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+      $$refDbh->commit();
+    }
+    # Download the files
+    my $nbrAlbumPics = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $$entry[0]);
+    my $albumPath    = $$refDbh->selectrow_array('SELECT path FROM ALBUMS WHERE id = ?'           , undef, $$entry[0]);
+    if ($albumStep == 4 and $nbrAlbumPics) {
+      if ($$refInfos{incSmallPics} or $$refInfos{incLargePics} or $$refInfos{incPublishDate}) {
+        $winPb->lblPbCurr2->Text("$STR{'Downloading'} $STR{'pictures'}...");
+        &dlAlbumFiles($refMech, $refDbh, $refInfos, $$entry[0], $albumPath);
+        $albumStep = 6;
+        $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+        $$refDbh->commit();
+      } else {
+        $albumStep = 6;
+        $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+        $$refDbh->commit();
+      }
+    }
+    # Album has been processed
+    if ($albumStep == 6) {
+      $winPb->lblPbCurr2->Text("$STR{'Finishing'}...");
+      # Delete temporary files
+      remove_tree($albumPath.'\temp') if -d $albumPath.'\temp' and $$refInfos{delTempFiles};
+      $albumStep = 7;
+      $sthUpdAlbumStep->execute($albumStep, $$entry[0]);
+      $$refDbh->commit();
+    }
+    # Progress
+    $count1++;
+    $winPb->pbWinPb1->StepIt();
+    $winPb->lblCount1->Text("$count1/$nbrAlbums");
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->lblPbCurr2->Text('');
+    $winPb->lblCount2->Text('');
+  }
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->lblCount1->Text('');
+  # Create Report
+  my $filename;
+  if    ($$refInfos{reportFormat} eq 'HTML') { $filename = &createAlbumReportHTML($refDbh, $refInfos); }
+  elsif ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createAlbumReportXLSX($refDbh, $refInfos); }
+  else                                       { $filename = &createAlbumReportTXT( $refDbh, $refInfos); }
+  $winPb->ChangeCursor($ARROW);
+  # Finish
+  $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  # Open the directory
+  Win32::Process::Create(my $ProcessObj, "$ENV{'WINDIR'}\\explorer.exe", "explorer $$refInfos{saveDir}", 0, NORMAL_PRIORITY_CLASS, ".")
+  if $$refInfos{openAlbumDir};
+  # Warn user about error
+  if ($$refInfos{incSmallPics} or $$refInfos{incLargePics}) {
+    my $nbrItems = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES');
+    my $nbrErrors;
+    $nbrErrors = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE smallPath IS NULL or smallPath = ?', undef, '-')
+    if $$refInfos{incSmallPics};
+    $nbrErrors = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE largePath IS NULL or largePath = ?', undef, '-')
+    if !$nbrErrors and $$refInfos{incLargePics};
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'dumpAlbumError'}, $STR{'Error'}, 0x40010) if $nbrErrors and !$$refInfos{silentProgress};
+  }
+  $$refDbh->commit();
+  $$refDbh->disconnect();
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incSmallPics} or $$refInfos{incLargePics} or $$refInfos{incPublishDate};
+
+}  #--- End dumpAlbums
+
+#--------------------------#
+sub dumpFriends
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos) = @_;
+  # Number of Friends categories
+  my @listCat = split(/\|/,$$refInfos{listCat});
+  my $nbrCatFriends = scalar(@listCat);
+  my $count1 = 0;
+  # Turn on progress bar
+  $winPb->pbWinPb1->SetRange(0, $nbrCatFriends);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblPbCurr1->Text('');
+  &createProfilesDB($refDbh); # Create table PROFILES
+  $winPb->Text("$STR{'Dump'} $STR{'Friends'} $STR{'inProgress'}...");
+  # Create image folder
+  mkdir("$$refInfos{saveDir}\\images_$$refInfos{filename}")
+  if !-d "$$refInfos{saveDir}\\images_$$refInfos{filename}" and $$refInfos{incIcons};
+  # Parse each friend category page
+  $winPb->lblCount1->Text("$count1/$nbrCatFriends");
+  foreach my $cat (@listCat) {
+    my $encodedName = encode($$refInfos{charSet}, $cat);
+    $winPb->lblPbCurr1->Text("$STR{'Processing'}: $encodedName");
+    # Dump friend category
+    &dumpFriendCat($refMech, $refDbh, $refInfos, $cat);
+    # Progress
+    $count1++;
+    $winPb->pbWinPb1->StepIt();
+    $winPb->lblCount1->Text("$count1/$nbrCatFriends");
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->lblPbCurr2->Text('');
+    $winPb->lblCount2->Text('');
+  }
+  # Parsing done, create the report
+  $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'outputFile'}...");
+  if ($nbrCatFriends) {
+    # Turn on progress bar
+    $winPb->lblCount1->Text("0/$nbrCatFriends");
+    $winPb->pbWinPb1->SetRange(0, $nbrCatFriends);
+    $winPb->pbWinPb1->SetPos(0);
+    $winPb->pbWinPb1->SetStep(1);
+    # Create and open the XLSX file
+    my $filename;
+    if    ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createProfilesReportXLSX($refDbh, $refInfos, 1); }
+    elsif ($$refInfos{reportFormat} eq 'HTML') { $filename = &createProfilesReportHTML($refDbh, $refInfos, 1); }
+    else                                       { $filename = &createProfilesReportTXT( $refDbh, $refInfos, 1); }
+    # Finish
+    $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  } else {
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'noProfileDumped'}, $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+  }
+  $winPb->ChangeCursor($ARROW);
+  $$refDbh->disconnect();
+  remove_tree("$$refInfos{saveDir}\\temp") if $$refInfos{delTempFiles};
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incIcons};
+
+}  #--- End dumpFriends
+
+#--------------------------#
+sub dumpMutualFriends
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos) = @_;
+  my $count1 = 0;
+  # Turn on the progress window
+  &createProfilesDB($refDbh); # Create table PROFILES
+  my $cat = $STR{'MutualFriends'};
+  $winPb->Text("$STR{'Dump'} $cat $STR{'inProgress'}...");
+  # Create folders
+  mkdir("$$refInfos{saveDir}\\images_$$refInfos{filename}")
+  if !-d "$$refInfos{saveDir}\\images_$$refInfos{filename}" and $$refInfos{incIcons};
+  # Dump Mutual Friends page
+  # Steps:
+  # 1: Open the page
+  # 2: Scroll the page
+  # 3: Save the page
+  # 4: Parse the page
+  $winPb->lblPbCurr1->Text("$STR{'Processing'}: $cat");
+  $$refInfos{groupType} = 1;
+  $$refInfos{"$STR{'MutualFriends'}-url"} = $$refInfos{startingURL};
+  # Opening the Group Members Category
+  if (!exists($$refInfos{"$cat-step"}) or !$$refInfos{"$cat-step"}) {
+    if ($$refMech->uri() ne $$refInfos{"$cat-url"}) {
+      $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}");
+      $winPb->pbWinPb2->SetPos(0);
+      $$refMech->get($$refInfos{"$cat-url"});
+      sleep($$refInfos{timeToWait});
+    }
+    $$refInfos{"$cat-step"} = 1;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Scrolling the Group Members Category
+  if ($$refInfos{"$cat-step"} == 1) {
+    if ($$refInfos{autoScroll}) {
+      $winPb->lblPbCurr2->Text("$STR{'Scrolling'} $STR{'thePage'}");
+      &scrollLikePage($refMech, $$refInfos{timeToWait});
+    }
+    $$refInfos{"$cat-step"} = 2;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Saving the Group Members Category
+  if ($$refInfos{"$cat-step"} == 2) {
+    $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}");
+    # Create the directories
+    mkdir("$$refInfos{saveDir}\\temp") if !-d "$$refInfos{saveDir}\\temp";
+    $$refInfos{"$cat-tmpPage"} = "$$refInfos{saveDir}\\temp\\page.html";
+    open(my $fhCurr, ">:encoding(utf8)", $$refInfos{"$cat-tmpPage"});
+    print $fhCurr $$refMech->content;
+    close($fhCurr);
+    $$refInfos{"$cat-step"} = 3;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing the Group Members Category
+  if ($$refInfos{"$cat-step"} == 3) {
+    $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}");
+    &parseMutualFriends($refDbh, $refInfos, $cat);
+    $$refInfos{"$cat-step"} = 4; # Parsing done
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Download profiles icons
+  if ($$refInfos{"$cat-step"} == 4) {
+    if ($$refInfos{incIcons}) { &dlProfilesIcons($refMech, $refDbh, $refInfos, $cat); }
+    $$refInfos{"$cat-step"} = 5;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Group Members category has been processed
+  if ($$refInfos{"$cat-step"} == 5) {
+    $winPb->lblPbCurr2->Text("$STR{'Finishing'}...");
+    # Delete temporary files
+    remove_tree("$$refInfos{saveDir}\\$$refInfos{filename}\\temp")
+    if -d "$$refInfos{saveDir}\\$$refInfos{filename}\\temp" and $$refInfos{delTempFiles};
+    $$refInfos{"$cat-step"} = 5;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing done, create the report
+  $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'outputFile'}...");
+  my $nbrMutualFriends = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES');
+  if ($nbrMutualFriends) {
+    # Create and open the XLSX file
+    my $filename;
+    if    ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createProfilesReportXLSX($refDbh, $refInfos, 3); }
+    elsif ($$refInfos{reportFormat} eq 'HTML') { $filename = &createProfilesReportHTML($refDbh, $refInfos, 3); }
+    else                                       { $filename = &createProfilesReportTXT( $refDbh, $refInfos, 3); }
+    # Finish
+    $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  } else {
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'noProfileDumped'}, $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+  }
+  $winPb->ChangeCursor($ARROW);
+  $$refDbh->disconnect();
+  remove_tree("$$refInfos{saveDir}\\temp") if $$refInfos{delTempFiles};
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incIcons};
+  
+}  #--- End dumpMutualFriends
+
+#--------------------------#
+sub dumpContrib
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos) = @_;
+  # First execution
+  $winPb->Text("$STR{'Dump'} $STR{'contributors'} $STR{'inProgress'}...");
+  # Steps (based on selected options)
+  # 1. Initiate
+  # 2. Foreach URLs in list
+  #   1: Open the page (if currURL is different from startingURL, scroll if autoscroll option has been selected)
+  #   2: Scroll and expand the page (if option has been selected)
+  #   3: Save the page
+  #   4: Parse the page
+  # 3: Dump Likes - Browse Likes Pages (open, save and parse)
+  # 4: Download profiles icons
+  # 5: Create report
+  
+  # Turn on progress bar
+  my $count1 = 0;
+  my $nbrOperations;
+  if ($winPb->lblCount1->Text()) { $nbrOperations = (split(/\//, $winPb->lblCount1->Text()))[1]; }
+  else                           { $nbrOperations = 5; }
+  $winPb->pbWinPb1->SetRange(0, $nbrOperations);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblCount1->Text("0/$nbrOperations");
+  # Initiate
+  if (!exists($$refInfos{step}) or !$$refInfos{step}) {
+    &createProfilesDB($refDbh); # Create table PROFILES
+    &createPicturesDB($refDbh); # Create table PICTURES
+    if ($$refInfos{startingURL}) {
+      $$refInfos{'currPageName'} = $STR{'CurrPage'};
+      $$refInfos{'currPageStep'} = 0;
+    }
+    $$refDbh->commit();
+    $$refInfos{step} = 1;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Recalculate number of operations
+  my $refAllURLs;
+  my $nbrURLs = 0;
+  if ($$refInfos{pageType}) { # Albums
+    $refAllURLs    = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+    $nbrURLs       = scalar(@$refAllURLs);
+    $nbrOperations = $nbrURLs + 3;
+  }
+  $winPb->pbWinPb1->SetRange(0, $nbrOperations);
+  my $currCount = (split(/\//, $winPb->lblCount1->Text()))[0];
+  $winPb->lblCount1->Text("$currCount/$nbrOperations");
+  # Foreach URLs in list
+  if ($$refInfos{step} == 1) {
+    $winPb->lblPbCurr1->Text("$STR{'browseAllPagesURLs'}...");
+    # Dump from current page if selected
+    &dumpContribComments($refMech, $refDbh, $refInfos, $$refInfos{startingID}, $$refInfos{currPageName},
+                         $$refInfos{startingURL}, 0, 1) if $$refInfos{startingURL};
+    foreach my $entry (@$refAllURLs) {
+      &dumpContribComments($refMech, $refDbh, $refInfos, $$entry[0], $$entry[1], $$entry[2], 1, 1);
+      $count1++;
+      $winPb->pbWinPb1->SetPos($count1);
+      $winPb->lblCount1->Text("$count1/$nbrOperations");
+    }
+    $$refInfos{step} = 2;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Dump Likes - Browse Likes Pages (open, save and parse)
+  if ($$refInfos{step} == 2) {
+    if ($$refInfos{likes}) {
+      $winPb->lblPbCurr1->Text("$STR{'Dump'} $STR{'Likes'} $STR{'inProgress'}...");
+      &dumpContribLikes($refMech, $refDbh, $refInfos);
+    }
+    $$refInfos{step} = 3;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Download profiles icons
+  if ($$refInfos{step} == 3) {
+    if ($$refInfos{incIcons}) { &dlProfilesIcons($refMech, $refDbh, $refInfos); }
+    $$refInfos{step} = 4;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Count profiles
+  if (!$$refInfos{nbrProfiles}) {
+    $$refInfos{nbrProfiles} = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES');
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing done, create the report
+  my $filename;
+  if ($$refInfos{nbrProfiles}) {
+    $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'outputFile'}...");
+    # Create and open the XLSX file
+    if    ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createProfilesReportXLSX($refDbh, $refInfos, 2); }
+    elsif ($$refInfos{reportFormat} eq 'HTML') { $filename = &createProfilesReportHTML($refDbh, $refInfos, 2); }
+    else                                       { $filename = &createProfilesReportTXT( $refDbh, $refInfos, 2); }
+    # Finish
+    $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  } else {
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'noProfileDumped'}, $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  $winPb->ChangeCursor($ARROW);
+  $$refDbh->disconnect();
+  remove_tree("$$refInfos{saveDir}\\temp") if $$refInfos{delTempFiles};
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incIcons};
+
+}  #--- End dumpContrib
+
+#--------------------------#
+sub dumpComments
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos) = @_;
+  &createProfilesDB($refDbh); # Create table PROFILES
+  &createCommentsDB($refDbh); # Create table COMMENTS
+  $winPb->Text("$STR{'Dump'} $STR{'contributors'} $STR{'inProgress'}...");
+  # Steps (based on selected options)
+  # 1. Initiate
+  # 2. Foreach URLs in list
+  #   1: Open the page (if currURL is different from startingURL, scroll if autoscroll option has been selected)
+  #   2: Scroll and expand the page (if option has been selected)
+  #   3: Save the page
+  #   4: Parse the page
+  # 3: Download profiles icons (if option has been selected)
+  # 4: Create report
+  
+  # Turn on progress bar
+  my $count1 = 0;
+  my $nbrOperations;
+  if ($winPb->lblCount1->Text()) { $nbrOperations = (split(/\//, $winPb->lblCount1->Text()))[1]; }
+  else                           { $nbrOperations = 4; }
+  $winPb->pbWinPb1->SetRange(0, $nbrOperations);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblCount1->Text("0/$nbrOperations");
+  # Initiate
+  if (!exists($$refInfos{step}) or !$$refInfos{step}) {
+    &createPicturesDB($refDbh); # Create table PICTURES
+    if ($$refInfos{startingURL}) {
+      $$refInfos{'currPageName'} = $STR{'CurrPage'};
+      $$refInfos{'currPageStep'} = 0;
+    }
+    $$refDbh->commit();
+    $$refInfos{step} = 1;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Recalculate number of operations
+  my $refAllURLs;
+  my $nbrURLs = 0;
+  if ($$refInfos{pageType} == 1) { # Albums
+    $refAllURLs    = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+    $nbrURLs       = scalar(@$refAllURLs);
+    $nbrOperations = $nbrURLs + 3;
+  }
+  if ($$refInfos{currPageName}) { $nbrOperations++; }
+  $winPb->pbWinPb1->SetRange(0, $nbrOperations);
+  my $currCount = (split(/\//, $winPb->lblCount1->Text()))[0];
+  $winPb->lblCount1->Text("$currCount/$nbrOperations");
+  # Foreach pages
+  if ($$refInfos{step} == 1) {
+    $winPb->lblPbCurr1->Text("$STR{'browseAllPagesURLs'}...");
+    # Dump from current page if selected
+    &dumpContribComments($refMech, $refDbh, $refInfos, $$refInfos{startingID}, $$refInfos{currPageName}, $$refInfos{startingURL}, 0, 2) if $$refInfos{startingURL};
+    foreach my $entry (@$refAllURLs) {
+      &dumpContribComments($refMech, $refDbh, $refInfos, $$entry[0], $$entry[1], $$entry[2], 1, 2);
+      $count1++;
+      $winPb->pbWinPb1->SetPos($count1);
+      $winPb->lblCount1->Text("$count1/$nbrOperations");
+    }
+    $$refInfos{step} = 2;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  } else {
+    $count1 += $nbrURLs;
+    $winPb->pbWinPb1->SetPos($count1);
+    $winPb->lblCount1->Text("$count1/$nbrOperations");
+  }
+  # Download profiles icons and other images (if option has been selected)
+  if ($$refInfos{step} == 2) {
+    if ($$refInfos{incIcons} ) {
+      $winPb->lblPbCurr1->Text("$STR{'Downloading'} $STR{'files'}...");
+      &dlProfilesIcons($refMech, $refDbh, $refInfos);
+      &dlCommentsImg(  $refMech, $refDbh, $refInfos);
+    }
+    $$refInfos{step} = 3;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  # Count comments
+  if (!$$refInfos{nbrComments}) {
+    $$refInfos{nbrComments} = $$refDbh->selectrow_array('SELECT COUNT(id) FROM COMMENTS');
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing done, create the report
+  my $filename;
+  if ($$refInfos{nbrComments}) {
+    $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'outputFile'}...");
+    # Create and open the XLSX file
+    if    ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createCommentReportXLSX($refDbh, $refInfos, $$refInfos{nbrComments}); }
+    elsif ($$refInfos{reportFormat} eq 'HTML') { $filename = &createCommentReportHTML($refDbh, $refInfos, $$refInfos{nbrComments}); }
+    else                                       { $filename = &createCommentReportTXT( $refDbh, $refInfos, $$refInfos{nbrComments}); }
+    # Finish
+    $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  } else {
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'noCommentsDumped'}, $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+  }
+  $count1++;
+  $winPb->pbWinPb1->SetPos($count1);
+  $winPb->lblCount1->Text("$count1/$nbrOperations");
+  $winPb->ChangeCursor($ARROW);
+  $$refDbh->disconnect();
+  remove_tree("$$refInfos{saveDir}\\temp") if $$refInfos{delTempFiles};
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incIcons};
+
+}  #--- End dumpComments
+
+#--------------------------#
+sub dumpGroupMembers
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $dbFile, $refInfos) = @_;
+  # Steps:
+  # 1: Open the page
+  # 2: Scroll the page
+  # 3: Save the page
+  # 4: Parse the page
+  my $count1 = 0;
+  # Turn on progress bar
+  $winPb->pbWinPb1->SetRange(0, 4);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblPbCurr1->Text('');
+  $winPb->lblCount1->Text('');
+  &createProfilesDB($refDbh); # Create table PROFILES
+  $winPb->Text("$STR{'Dump'} $STR{'groupMembers'} $STR{'inProgress'}...");
+  # Create folders
+  mkdir("$$refInfos{saveDir}\\images_$$refInfos{filename}")
+  if !-d "$$refInfos{saveDir}\\images_$$refInfos{filename}" and $$refInfos{incIcons};
+  # Opening the Group Members page
+  if (!exists($$refInfos{step}) or !$$refInfos{step}) {
+    if ($$refMech->uri() ne $$refInfos{startingURL}) {
+      $winPb->lblPbCurr1->Text("$STR{'Opening'} $STR{'thePage'}");
+      $$refMech->get($$refInfos{startingURL});
+      sleep($$refInfos{timeToWait});
+    }
+    $$refInfos{step} = 1;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $winPb->pbWinPb1->SetPos($$refInfos{step});
+  $winPb->lblCount1->Text("$$refInfos{step}/4");
+  # Scrolling the Group Members page
+  if ($$refInfos{step} == 1) {
+    if ($$refInfos{autoScroll}) {
+      $winPb->lblPbCurr1->Text("$STR{'Scrolling'} $STR{'thePage'}");
+      sleep($$refInfos{timeToWait});
+      $$refMech->eval_in_page("var el = document.getElementsByClassName('uiMorePagerPrimary'); for (var i=0;i<el.length; i++) { el[i].click(); }"); # Expand Admins list
+      &scrollPage($refMech, $$refInfos{timeToWait});
+    }
+    $$refInfos{step} = 2;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $winPb->pbWinPb1->SetPos($$refInfos{step});
+  $winPb->lblCount1->Text("$$refInfos{step}/4");
+  # Saving the Group Members page
+  if ($$refInfos{step} == 2) {
+    $winPb->lblPbCurr1->Text("$STR{'Saving'} $STR{'thePage'}");
+    # Create the directories
+    mkdir("$$refInfos{saveDir}\\temp") if !-d "$$refInfos{saveDir}\\temp";
+    $$refInfos{tmpPage} = "$$refInfos{saveDir}\\temp\\page.html";
+    open(my $fhCurr, ">:encoding(utf8)", $$refInfos{tmpPage});
+    print $fhCurr $$refMech->content;
+    close($fhCurr);
+    $$refInfos{step} = 3;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $winPb->pbWinPb1->SetPos($$refInfos{step});
+  $winPb->lblCount1->Text("$$refInfos{step}/4");
+  # Parsing the Group Members page
+  if ($$refInfos{step} == 3) {
+    $winPb->lblPbCurr1->Text("$STR{'Parsing'} $STR{'thePage'}");
+    &parseGroupMembers($refDbh, $refInfos);
+    $$refInfos{step} = 4;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  $winPb->pbWinPb1->SetPos($$refInfos{step});
+  $winPb->lblCount1->Text("$$refInfos{step}/4");
+  # Download profiles icons
+  if ($$refInfos{step} == 4) {
+    if ($$refInfos{incIcons}) { &dlProfilesIcons($refMech, $refDbh, $refInfos); }
+    $$refInfos{step} = 5;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing done, create the report
+  $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'outputFile'}...");
+  if ($$refInfos{nbrMembers}) {
+    # Turn on progress bar
+    $winPb->lblCount1->Text("0/$$refInfos{nbrMembers}");
+    $winPb->pbWinPb1->SetRange(0, $$refInfos{nbrMembers});
+    $winPb->pbWinPb1->SetPos(0);
+    $winPb->pbWinPb1->SetStep(1);
+    # Create and open the XLSX file
+    my $filename;
+    if    ($$refInfos{reportFormat} eq 'XLSX') { $filename = &createProfilesReportXLSX($refDbh, $refInfos, 3); }
+    elsif ($$refInfos{reportFormat} eq 'HTML') { $filename = &createProfilesReportHTML($refDbh, $refInfos, 3); }
+    else                                       { $filename = &createProfilesReportTXT( $refDbh, $refInfos, 3); }
+    # Finish
+    $winPb->ShellExecute('open', $filename,'','',1) if $$refInfos{openReport} and $filename;
+  } else {
+    $winPb->Hide();
+    Win32::GUI::MessageBox($winPb, $STR{'noProfileDumped'}, $STR{'Error'}, 0x40010) if !$$refInfos{silentProgress};
+  }
+  $winPb->ChangeCursor($ARROW);
+  $$refDbh->disconnect();
+  remove_tree("$$refInfos{saveDir}\\temp") if $$refInfos{delTempFiles};
+  $$refMech->get($$refInfos{startingURL} ) if $$refInfos{incIcons};
+  
+}  #--- End dumpGroupMembers
+
+#--------------------------#
+sub parseAlbumPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos, $albumId) = @_;
+  # Current number of pics
+  my $ind                   = 0;
+  $ind                      = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $albumId);
+  my ($tmpPage, $albumPath) = $$refDbh->selectrow_array('SELECT tmpPage, path FROM ALBUMS WHERE id = ?'  , undef, $albumId);
+  # Load content from file
+  my $dom = new HTML::DOM(charset => 'utf8');
+  $dom->parse_file($tmpPage);
+  my @photoTags;
+  # Page profile
+  if ($$refInfos{pageType} == 3) { @photoTags = $dom->getElementsByClassName('_2eea'); }
+  # Group or People profile
+  else {
+    my $photoContent = $dom->getElementById('fbTimelinePhotosContent');
+       $photoContent = $dom->getElementById('set_photos_pagelet') if !$photoContent;
+    @photoTags       = $photoContent->getElementsByClassName('fbPhotoCurationControlWrapper');
+  }
+  # Turn on progress bar
+  my $i         = 0;
+  my $nbrPhotos = scalar(@photoTags);
+  $winPb->pbWinPb2->SetRange(0, $nbrPhotos);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("0/$nbrPhotos");
+  my $sthPictures = $$refDbh->prepare('INSERT OR REPLACE INTO PICTURES (album,ind,pageURL,smallURL,pubDate,largeURL) VALUES(?,?,?,?,?,?)');
+  foreach my $tag (@photoTags) {
+    if (my $urlNode = ($tag->getElementsByTagName('a'))[0]) {
+      my $pubDate  = '-';
+      my $largeURL = '-';
+      my $url = $urlNode->{href};
+      my ($smallURL, $imgNode, $backgroundImgCode);
+      if ($imgNode = ($urlNode->getElementsByTagName('img'))[0]) { $smallURL = $imgNode->{src}; }
+      if ($smallURL and $smallURL =~ /rsrc.php/ and $imgNode->{style}) {
+        $backgroundImgCode = $imgNode->{style};
+      } elsif (!$smallURL  and $imgNode = ($urlNode->getElementsByClassName('uiMediaThumbImg'))[0]) { # Group
+        $backgroundImgCode = $imgNode->{style};
+      }
+      if ($backgroundImgCode and $backgroundImgCode =~ /background-image: url\(\'?([^\)\']+)/) {
+        $smallURL = $1;
+        $smallURL =~ s/&amp;/&/g;
+        $smallURL =~ s/\\([0-9a-fA-F]{2}) /chr(hex($1))/eg if $smallURL =~ /^https\\3a/;
+      }
+      if ($smallURL) {
+        $url = 'https://www.facebook.com'.$url if $url !~ /^http/;
+        # Open large picture
+        if ($$refInfos{incLargePics} or $$refInfos{incPublishDate} or $$refInfos{reportFormat} ne 'HTML') {
+          if ($url =~ /$albumId\/([^\/]+)\// or $url =~ /fbid=([^\&]+)/) {
+            my $picID = $1;
+            # Open the popup
+            $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}...");
+            if ($$refInfos{pageType} == 3) { # Page profile
+              $$refMech->eval_in_page("var el=document.getElementsByClassName('_2eea');for(var i=0;i<el.length;i++) {var link=(el[i].getElementsByTagName('a'))[0];var regex=new RegExp($picID);var href=link.href;if(href && regex.test(href)){console.log('ok');link.click();break;}}");
+            } else {                         # Group or People profile
+              $$refMech->eval_in_page("var el=document.getElementsByClassName('fbPhotoCurationControlWrapper');for(var i=0;i<el.length;i++) {var link=(el[i].getElementsByTagName('a'))[0];var regex=new RegExp($picID);var href=link.href;if(href && regex.test(href)){console.log('ok');link.click();break;}}");
+            }
+            sleep($$refInfos{timeToWait});
+            # Save the picture page
+            $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}...");
+            my $pagePath = "$albumPath\\temp\\Album_$albumId"."_$picID.html";
+            if (!-e $pagePath) {
+              open(my $fhCurr, ">:encoding(utf8)", $pagePath);
+              print $fhCurr $$refMech->content;
+              close($fhCurr);
+            }
+            # Parse the picture page
+            if (-T $pagePath) {
+              $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}...");
+              my $dom = new HTML::DOM(charset => 'utf8');
+              if ($dom->parse_file($pagePath)) {
+                # Get the photo url
+                if (my $imgSel = ($dom->getElementsByClassName('spotlight'))[0]) {
+                  $largeURL = $imgSel->{src};
+                }
+                # Get the publication date
+                if (my $dateCode = ($dom->getElementsByClassName('_39g5'))[0]) {
+                  if (my $dateSel = ($dateCode->getElementsByTagName('abbr'))[0]) {
+                    $pubDate = $dateSel->{'data-utime'};
+                  }
+                }
+              }
+            }
+            # Close the popup
+            $$refMech->eval_in_page("var el= (document.getElementsByClassName('_xlt _418x'))[0];if(el){el.click();}");
+          }
+        }
+        $sthPictures->execute($albumId, $ind, $url, $smallURL, $pubDate, $largeURL);
+        $ind++;
+      }
+    }
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$i/$nbrPhotos");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End parseAlbumPage
+
+#--------------------------#
+sub dlAlbumFiles
+#--------------------------#
+{
+  # Local variables
+  my ($refMechAlbum, $refDbh, $refInfos, $albumId, $albumPath) = @_;
+  my $nbrAlbumPictures = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $albumId);
+  my $sthAll           = $$refDbh->prepare('SELECT album,ind,smallURL,smallPath,largeURL,largePath,videoURL,videoPath FROM PICTURES WHERE album = ?');
+  $sthAll->execute($albumId);
+  # Turn on progress bar
+  my $count2 = 0;
+  $winPb->pbWinPb2->SetRange(0, $nbrAlbumPictures);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+  # Download all files
+  my $sthPicturesUpd = $$refDbh->prepare('UPDATE PICTURES SET smallName = ?, smallPath = ?, smallRelPath = ?, ' .
+                                         'largeName = ?, largePath = ?, largeRelPath = ? WHERE album = ? AND ind = ?');
+  while (my $entry = $sthAll->fetchrow_arrayref()) {
+    my $smallName    = undef;
+    my $smallPath    = undef;
+    my $smallRelPath = undef;
+    my $largeName    = undef;
+    my $largePath    = undef;
+    my $largeRelPath = undef;
+    # Download the small picture
+    if ($$refInfos{incSmallPics} and !$$entry[3] and $$entry[2] and $$entry[2] =~ /http/ and $$entry[2] =~ /\/([^\?\/]+)\?/) {
+      $smallName    = $1;
+      $smallName    =~ s/\.jpg/_small\.jpg/;
+      my $encFName  = encode('utf8', $smallName);
+      $smallPath    = $albumPath."\\".$encFName;
+      my $count = 0;
+      while (!-e $smallPath and $count < 10) { # Try to save the image 10 times
+        $$refMechAlbum->get($$entry[2]);
+        $$refMechAlbum->saveResources_future(target_file => $smallPath, target_dir  => $albumPath)->get();
+        if (my $content = $$refMechAlbum->{response}->{_content}) {
+          open(IMG, ">$smallPath");
+          binmode(IMG);
+          print IMG $content;
+          close(IMG);
+        }
+        $count++;
+      }
+      $smallRelPath = $smallPath =~ s/\Q$$refInfos{saveDir}\E\\/\.\//r;
+    }
+    # Download the large picture
+    if ($$refInfos{incLargePics} and !$$entry[5] and $$entry[4] and $$entry[4] =~ /\/([^\/\?]+)(?:\?|$)/) {
+      $largeName    = $1;
+      $largeName    =~ s/\.jpg/_large\.jpg/;
+      my $encFName  = encode('utf8', $largeName);
+      $largePath    = $albumPath."\\".$encFName;
+      my $count = 0;
+      while (!-e $largePath and $count < 10) { # Try to save the image 10 times
+        $$refMechAlbum->get($$entry[4]);
+        sleep(1);
+        $$refMechAlbum->saveResources_future(target_file => $largePath, target_dir  => $albumPath)->get();
+        if (my $content = $$refMechAlbum->{response}->{_content}) {
+          open(IMG, ">$largePath");
+          binmode(IMG);
+          print IMG $content;
+          close(IMG);
+        }
+        $count++;
+      }
+      $largeRelPath = $largePath =~ s/\Q$$refInfos{saveDir}\E\\/\.\//r;
+    }
+    $sthPicturesUpd->execute($smallName, $smallPath, $smallRelPath, $largeName, $largePath, $largeRelPath, $$entry[0], $$entry[1]);
+    # Update progress
+    $count2++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End dlAlbumFiles
+
+#--------------------------#
+sub dumpFriendCat
+#--------------------------#
+{
+  # Local variables
+  my ($refMechFriends, $refDbh, $refInfos, $cat) = @_;
+  my $encodedName = encode($$refInfos{charSet}, $cat);
+  # Check if processing of current Category has been started (in case of resume)
+  $$refInfos{"$cat-step"} = 0 if !exists($$refInfos{"$cat-step"});
+  # Steps:
+  # 1: Open the page
+  # 2: Scroll the page
+  # 3: Save the page
+  # 4: Parse the page
+  
+  # Opening the Friends Category Tab
+  if (!$$refInfos{"$cat-step"}) {
+    $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}");
+    $winPb->lblCount2->Text('');
+    $winPb->pbWinPb2->SetPos(0);
+    # If not already on the page...
+    $$refMechFriends->get($$refInfos{"$cat-url"});
+    sleep($$refInfos{timeToWait});
+    $$refInfos{"$cat-step"}++;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Scrolling the Friends Category Tab
+  if ($$refInfos{"$cat-step"} == 1) {
+    $winPb->lblPbCurr2->Text("$STR{'Scrolling'} $STR{'thePage'}");
+    if ($$refInfos{"$cat-url"} !~ /followers/) { &scrollFriendPage($refMechFriends, $$refInfos{timeToWait}); }
+    else                                       { &scrollLikePage(  $refMechFriends, $$refInfos{timeToWait}); }
+    $$refInfos{"$cat-step"}++;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Saving the Friends Category Tab
+  if ($$refInfos{"$cat-step"} == 2 or !$$refInfos{"$cat-tmpPage"} or !-T $$refInfos{"$cat-tmpPage"}) {
+    $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}");
+    # Create the directories
+    mkdir("$$refInfos{saveDir}\\temp") if !-d "$$refInfos{saveDir}\\temp";
+    # Save the page
+    $$refInfos{"$cat-tmpPage"} = "$$refInfos{saveDir}\\temp\\page_".$$refInfos{"$cat-id"}.".html";
+    open(my $fhCurr, ">:encoding(utf8)", $$refInfos{"$cat-tmpPage"});
+    print $fhCurr $$refMechFriends->content;
+    close($fhCurr);
+    $$refInfos{"$cat-step"} = 3;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Parsing the Friends Category Tab
+  if ($$refInfos{"$cat-step"} == 3) {
+    $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}");
+    &parseFriendCat($refDbh, $refInfos, $cat);
+    $$refInfos{"$cat-step"}++; # Parsing done
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Download profiles icons
+  if ($$refInfos{"$cat-step"} == 4) {
+    if ($$refInfos{incIcons}) { &dlProfilesIcons($refMechFriends, $refDbh, $refInfos, $cat); }
+    $$refInfos{"$cat-step"} = 5;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  # Friend category has been processed
+  if ($$refInfos{"$cat-step"} == 5) {
+    $winPb->lblPbCurr2->Text("$STR{'Finishing'}...");
+    # Delete temporary files
+    remove_tree("$$refInfos{saveDir}\\$$refInfos{filename}\\temp")
+    if -d "$$refInfos{saveDir}\\$$refInfos{filename}\\temp" and $$refInfos{delTempFiles};
+    $$refInfos{"$cat-step"}++;
+    &updateDumpDB_INFOS($refDbh, $refInfos);
+  }
+  
+}  #--- End dumpFriendCat
+
+#--------------------------#
+sub parseFriendCat
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $cat) = @_;
+  my $encodedCatName = encode($$refInfos{charSet}, $cat);
+  my @friends;
+  my $nbrFriends;
+  # Parse by section and groups
+  if (-T $$refInfos{"$cat-tmpPage"}) {
+    my $dom = new HTML::DOM(charset => 'utf8');
+    if ($dom->parse_file($$refInfos{"$cat-tmpPage"})) {
+      my $content = $dom->getElementById('pagelet_timeline_medley_friends');
+      @friends    = $content->getElementsByClassName('_698');
+      $nbrFriends = scalar(@friends);
+      if (!$nbrFriends) { # Followers category
+        $content = $dom->getElementById('pagelet_collections_followers');
+        @friends    = $content->getElementsByClassName('fbProfileBrowserListItem');
+        $nbrFriends = scalar(@friends);
+      }
+    }
+  }
+  # Turn on progress bar
+  my $ind = 0;
+  $winPb->pbWinPb2->SetRange(0, $nbrFriends);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("0/$nbrFriends");
+  my $sthProfiles = $$refDbh->prepare('INSERT OR REPLACE INTO PROFILES (cat,id,ind,name,url,details,pictureURL) VALUES(?,?,?,?,?,?,?)');
+  # Parse friends details
+  my $i = 0;
+  foreach my $friend (@friends) {
+    my ($url, $id, $pictureURL, $name, $details);
+    # Get profil id, profil url, image url and name
+    if (my $friendLink = ($friend->getElementsByTagName('a'))[0]) {
+      $url = $friendLink->href;
+      if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+      if (my $dataHC = $friendLink->{'data-hovercard'}) {
+        if ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+      }
+      if (my $imageTag = ($friendLink->getElementsByTagName('img'))[0]) {
+        $pictureURL = $imageTag->src;
+        $name       = $imageTag->{'aria-label'}
+      } else { $name = undef; }
+    }
+    # Get details
+    if (my $friendDiv = ($friend->getElementsByClassName('_50hf fsm fwn'))[0]) {
+      $details = $friendDiv->innerHTML;
+      $details =~ s/<[^\>]+>//g;
+      $details = decode_entities($details);
+    } else { $details = undef; }
+    # Minimum details required
+    if ($url and $id and $pictureURL) {
+      $sthProfiles->execute($cat, $id, $ind, $name, $url, $details, $pictureURL);
+      $ind++;
+    }
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$i/$nbrFriends");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End parseFriendCat
+
+#--------------------------#
+sub dumpContribComments
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos, $pageID, $pageName, $pageURL, $type, $typeDump) = @_;
+  # $type    : 0=Current page, 1=Album page
+  # $typeDump: 1=Contrib, 2=Comments
+  
+  my $sthUpdURLStep = $$refDbh->prepare('UPDATE ALBUMS SET step = ? WHERE id = ?') if $type;
+  my ($URLStep, $refAlbum, $pagePath);
+  if ($type) {
+    $refAlbum = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS WHERE id = ?', undef, $pageID);
+    $URLStep  = $$refAlbum[0][5];
+    $pagePath = $$refAlbum[0][3];
+  } else {
+    $URLStep  = $$refInfos{currPageStep};
+    $pagePath = $$refInfos{currPageTmpPage};
+  }
+  # Open the page (if currURL in browser is different from url to process)
+  if (!$URLStep) {
+    if ($$refMech->uri() ne $pageURL) {
+      $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}...");
+      $$refMech->get($pageURL);
+      sleep($$refInfos{timeToWait});
+    }
+    $URLStep = 1;
+    if ($type) { $sthUpdURLStep->execute($URLStep, $pageID); }
+    else       { $$refInfos{currPageStep} = $URLStep; &updateDumpDB_INFOS($refDbh, $refInfos); }
+    $$refDbh->commit();
+  }
+  # Scroll and expand the page (if option has been selected)
+  if ($URLStep == 1) {
+    if ($$refInfos{autoScroll}) {
+      $winPb->lblPbCurr2->Text("$STR{'ScrollExpand'} $STR{'thePage'}...");
+      &scrollPage($refMech, $$refInfos{timeToWait}); &expandContent($refMech);
+    }
+    $URLStep = 2;
+    if ($type) { $sthUpdURLStep->execute($URLStep, $pageID); }
+    else       { $$refInfos{currPageStep} = $URLStep; &updateDumpDB_INFOS($refDbh, $refInfos); }
+    $$refDbh->commit();
+  }
+  # Save the page
+  if ($URLStep == 2 or !$pagePath or !-e $pagePath) {
+    $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}...");
+    mkdir("$$refInfos{saveDir}\\temp") if !-d "$$refInfos{saveDir}\\temp";
+    $pagePath = "$$refInfos{saveDir}\\temp\\temp_".$pageID.'.html';
+    open(my $fhCurr, ">:encoding(utf8)", $pagePath);
+    print $fhCurr $$refMech->content;
+    close($fhCurr);
+    if ($type) { 
+      my $sthUpdURLTmpPage = $$refDbh->prepare('UPDATE ALBUMS SET tmpPage = ? WHERE id = ?');
+      $sthUpdURLTmpPage->execute($pagePath, $pageID);
+    } else { $$refInfos{currPageTmpPage} = $pagePath; }
+    $URLStep = 3;
+    if ($type) { $sthUpdURLStep->execute($URLStep, $pageID); }
+    else       { $$refInfos{currPageStep} = $URLStep; &updateDumpDB_INFOS($refDbh, $refInfos); }
+    $$refDbh->commit();
+  }
+  # Parse the page
+  if ($URLStep == 3) {
+    $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}...");
+    if ($type) { &parseAlbumContribComments($refMech, $refDbh, $refInfos, $pageID, $pagePath, $pageURL, $typeDump); }
+    else {
+      if ($typeDump == 1) { &parseContrib( $refDbh, $refInfos, $pagePath);           }
+      else                { &parseComments($refDbh, $refInfos, $pagePath, $pageURL); }
+    }
+    $URLStep = 4;
+    if ($type) { $sthUpdURLStep->execute($URLStep, $pageURL); }
+    else       { $$refInfos{currPageStep} = $URLStep; &updateDumpDB_INFOS($refDbh, $refInfos); }
+    $$refDbh->commit();
+  }
+  
+}  #--- End dumpContribComments
+
+#--------------------------#
+sub parseAlbumContribComments
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos, $pageID, $pagePath, $pageURL, $typeDump) = @_;
+  # $typeDump: 1=Contrib, 2=Comments
+  
+  # Load content from file
+  my $dom = new HTML::DOM(charset => 'utf8');
+  $dom->parse_file($pagePath);
+  my $photoContent = $dom->getElementById('fbTimelinePhotosContent');
+  my @photoTags    = $photoContent->getElementsByClassName('fbPhotoCurationControlWrapper');
+  # Turn on progress bar
+  my $i         = 0;
+  my $nbrPhotos = scalar(@photoTags);
+  $winPb->pbWinPb2->SetRange(0, $nbrPhotos);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("0/$nbrPhotos");
+  foreach my $tag (@photoTags) {
+    if (my $urlNode = ($tag->getElementsByTagName('a'))[0]) {
+      my $url = $urlNode->{href};
+      $url = 'https://www.facebook.com'.$url if $url !~ /^http/;
+      if ($url =~ /$pageID\/([^\/]+)\// or $url =~ /fbid=([^\&]+)/) {
+        my $picID = $1;
+        # Open the popup
+        $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'thePage'}...");
+        $$refMech->eval_in_page("var el=document.getElementsByClassName('fbPhotoCurationControlWrapper');for(var i=0;i<el.length;i++) {var link=(el[i].getElementsByTagName('a'))[0];var regex=new RegExp($picID);var href=link.href;if(href && regex.test(href)){console.log('ok');link.click();break;}}");
+        sleep($$refInfos{timeToWait});
+        # Scroll and expand
+        if ($$refInfos{autoScroll}) {
+          $winPb->lblPbCurr2->Text("$STR{'ScrollExpand'} $STR{'thePage'}...");
+          &expandContent($refMech);
+        }
+        # Save the picture page
+        $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'thePage'}...");
+        my $photoPagePath = "$$refInfos{saveDir}\\temp\\Album_$pageID"."_$picID.html";
+        if (!-e $photoPagePath) {
+          open(my $fhCurr, ">:encoding(utf8)", $photoPagePath);
+          print $fhCurr $$refMech->content;
+          close($fhCurr);
+        }
+        # Parse the picture page
+        if (-T $photoPagePath) {
+          $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'thePage'}...");
+          if ($typeDump == 1) { &parseContrib( $refDbh, $refInfos, $photoPagePath);       }
+          else                { &parseComments($refDbh, $refInfos, $photoPagePath, $url); }
+        }
+        # Close the popup
+        $$refMech->eval_in_page("var el= (document.getElementsByClassName('_xlt _418x'))[0];if(el){el.click();}");
+      }
+    }
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$i/$nbrPhotos");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End parseAlbumContribComments
+
+#--------------------------#
+sub parseContrib
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $tmpPage) = @_;
+  my $sthProfiles    = $$refDbh->prepare('INSERT INTO PROFILES (cat,id,ind,name,url,pictureURL,nbr) VALUES(?,?,?,?,?,?,?)');
+  my $sthProfilesUpd = $$refDbh->prepare('UPDATE PROFILES SET nbr = ? WHERE cat = ? AND id = ?');
+  # Parse the file
+  my $dom = new HTML::DOM(charset => 'utf8');
+  if ($dom->parse_file($tmpPage)) {
+    # Comments
+    if ($$refInfos{comments}) {
+      my @commentNodes = $dom->getElementsByClassName('_3mf5');
+      my $ind = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES');
+      # Parse each comment
+      foreach my $commentNode (@commentNodes) {
+        my ($id, $url, $name, $profileImg);
+        # Get profil id, profil url, image url and name
+        if ($commentNode->{_tag} eq 'a' and $url = $commentNode->href) {
+          if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+          $url = "https://www.facebook.com$url" if $url !~ /^http/;
+          if (my $dataHC = $commentNode->{'data-hovercard'}) {
+            if ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+          }
+          if (my $imageTag = ($commentNode->getElementsByTagName('img'))[0]) {
+            $profileImg = $imageTag->src;
+            $name       = $imageTag->{'alt'}
+          }
+          if ($url and $id and $profileImg and $name and $name ne $$refInfos{filename}) {
+            if (!$$refInfos{startingID} or $$refInfos{startingID} != $id) { # Comments by owner of the page are ignored
+              # Already exists, count
+              if (my $exists = $$refDbh->selectrow_array('SELECT nbr FROM PROFILES WHERE cat == ? AND id = ?', undef,
+                                                         $STR{'Comments'}, $id)) {
+                $sthProfilesUpd->execute($exists+1, $STR{'Comments'}, $id);
+              # Add a new entry
+              } else {
+                $sthProfiles->execute($STR{'Comments'}, $id, $ind, $name, $url, $profileImg, 1);
+                $ind++;
+              }
+            }
+          }
+        }
+      }
+      $$refDbh->commit();
+    }
+    # Likes
+    if ($$refInfos{likes}) {
+      $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'Likes'} $STR{'inProgress'}...");
+      my @likesNodes  = $dom->getElementsByClassName('_3dlf');
+      my @likesNodes2 = $dom->getElementsByClassName('_1lh9 _1lha _42ft');
+      push(@likesNodes, @likesNodes2);
+      &parseContribLikesPages($refDbh, $refInfos, \@likesNodes);
+    }
+  }
+  
+}  #--- End parseContrib
+
+#--------------------------#
+sub parseContribProfiles
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $type, $refParts, $refSthProfiles, $refSthProfilesUpd, $updProgress) = @_;
+  # Turn on progress bar
+  my $ind     = 0;
+  my $count2  = 0;
+  my $nbrProfiles = scalar(@$refParts);
+  if ($updProgress) {
+    $winPb->pbWinPb2->SetRange(0, $nbrProfiles);
+    $winPb->pbWinPb2->SetStep(1);
+    $winPb->lblCount2->Text("0/$refParts");
+    $winPb->lblPbCurr2->Text("$STR{'Parsing'} $type $STR{'inProgress'}...");
+  }
+  foreach my $profileCode (@$refParts) {
+    my ($url, $id, $name, $profileImg);
+    # Get profil id, profil url, image url and name
+    if (my $profileLink = ($profileCode->getElementsByTagName('a'))[0]) {
+      $url = $profileLink->href;
+      if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+      if (my $dataHC = $profileLink->{'data-hovercard'}) {
+        if ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+      }
+      if (my $imageTag = ($profileLink->getElementsByTagName('img'))[0]) {
+        $profileImg = $imageTag->src;
+        $name       = $imageTag->{'aria-label'}
+      } else { $name = undef; }
+    }
+    if ($url and $id and $profileImg and $name and $name ne $$refInfos{filename}) {
+      if (!$$refInfos{startingID} or $$refInfos{startingID} != $id) { # Contribution by owner of the page are ignored
+        # Already exists, count
+        if (my $exists = $$refDbh->selectrow_array('SELECT nbr FROM PROFILES WHERE cat == ? AND id = ?', undef,
+                                                   $type, $id)) {
+          $$refSthProfilesUpd->execute($exists+1, $type, $id);
+        # Add a new entry
+        } else {
+          $$refSthProfiles->execute($type, $id, $ind, $name, $url, $profileImg, 1);
+          $ind++;
+        }
+      }
+    }
+    $count2++;
+    if ($updProgress) {
+      $winPb->pbWinPb2->StepIt();
+      $winPb->lblCount2->Text("$count2/$nbrProfiles");
+    }
+  }
+  if ($updProgress) {
+    $winPb->lblPbCurr2->Text('');
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->lblCount2->Text('');
+  }
+  $$refDbh->commit();
+  
+}  #--- End parseContribProfiles
+
+#--------------------------#
+sub parseContribLikesPages
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $refLikesNodes) = @_;
+  &createlikesPagesDB($refDbh);
+  my $sthLikesPages = $$refDbh->prepare('INSERT OR REPLACE INTO LIKES_PAGES (url,status) VALUES(?,?)');
+  # Turn on progress bar
+  my $count2      = 0;
+  my $nbrLikesNode = scalar(@{$refLikesNodes});
+  $winPb->pbWinPb2->SetRange(0, $nbrLikesNode);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("0/$nbrLikesNode");
+  foreach my $likesLink (@{$refLikesNodes}) {
+    my $url = $likesLink->{href};
+    $url = "https://www.facebook.com$url" if $url !~ /^http/;
+    $url    =~ s/&amp;/&/g;
+    $sthLikesPages->execute($url, 0);
+    $count2++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$count2/$nbrLikesNode");
+  }
+  $winPb->lblPbCurr2->Text('');
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  $$refDbh->commit();
+  
+}  #--- End parseContribLikesPages
+  
+#--------------------------#
+sub dumpContribLikes
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos) = @_;
+  my $allLikesPages     = $$refDbh->selectall_arrayref('SELECT url FROM LIKES_PAGES WHERE status = 0');
+  my $sthLikesPagesUpd  = $$refDbh->prepare('UPDATE LIKES_PAGES SET status = 1 WHERE url = ?');
+  my $sthProfiles       = $$refDbh->prepare('INSERT INTO PROFILES (cat,id,ind,name,url,pictureURL,nbr) VALUES(?,?,?,?,?,?,?)');
+  my $sthProfilesUpd    = $$refDbh->prepare('UPDATE PROFILES SET nbr = ? WHERE cat = ? AND id = ?');
+  my $nbrLikesPages     = scalar(@$allLikesPages);
+  if ($nbrLikesPages > 0) {
+    # Turn on progress bar
+    my $count2 = 0;
+    $winPb->pbWinPb2->SetRange(0, $nbrLikesPages);
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->pbWinPb2->SetStep(1);
+    $winPb->lblCount2->Text("0/$nbrLikesPages");
+    # Browse each like pages
+    foreach my $likePageUrl (@$allLikesPages) {
+      # Open the page
+      $winPb->lblPbCurr2->Text("$STR{'Opening'} $STR{'LikesPage'}");
+      $$refMech->get($$likePageUrl[0]);
+      sleep($$refInfos{timeToWait});
+      # Scroll the page
+      $winPb->lblPbCurr2->Text("$STR{'Scrolling'} $STR{'LikesPage'}");
+      &scrollLikePage($refMech, $$refInfos{timeToWait});
+      # Save the page
+      $winPb->lblPbCurr2->Text("$STR{'Saving'} $STR{'LikesPage'}");
+      my $htmlPage = "$$refInfos{saveDir}\\temp\\likePage.html";
+      open(my $fhCurr, ">:encoding(utf8)", $htmlPage);
+      print $fhCurr $$refMech->content;
+      close($fhCurr);
+      # Gather each profile details
+      $winPb->lblPbCurr2->Text("$STR{'Parsing'} $STR{'LikesPage'}");
+      my $dom = new HTML::DOM(charset => 'utf8');
+      if ($dom->parse_file($htmlPage)) {
+        my @likesNodes = $dom->getElementsByClassName('_5i_q');
+        &parseContribProfiles($refDbh, $refInfos, $STR{'Likes'}, \@likesNodes, \$sthProfiles, \$sthProfilesUpd, 0);
+      }
+      # Progress
+      $count2++;
+      $sthLikesPagesUpd->execute($$likePageUrl[0]);
+      $winPb->pbWinPb2->SetPos($count2);
+      $winPb->lblCount2->Text("$count2/$nbrLikesPages");
+      $$refDbh->commit();
+    }
+    $winPb->lblPbCurr2->Text('');
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->lblCount2->Text('');
+  }
+  
+}  #--- End dumpContribLikes
+
+#--------------------------#
+sub parseComments
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $tmpPage, $currUrl) = @_;
+  my $sthProfiles      = $$refDbh->prepare('INSERT INTO PROFILES (cat,id,ind,name,url,pictureURL,nbr) VALUES(?,?,?,?,?,?,?)');
+  my $sthProfilesUpd   = $$refDbh->prepare('UPDATE PROFILES SET nbr = ? WHERE cat = ? AND id = ?');
+  my $sthComments      = $$refDbh->prepare('INSERT INTO COMMENTS (id,profilId,date,msg,url,depth) VALUES(?,?,?,?,?,?)');
+  my $sthCommentsFiles = $$refDbh->prepare('INSERT OR IGNORE INTO COMMENTS_FILES (url) VALUES(?)');
+  my $commentId        = $$refDbh->selectrow_array('SELECT COUNT(id) FROM COMMENTS')+1;
+  # Parse all comments
+  my $dom = new HTML::DOM(charset => 'utf8');
+  if ($dom->parse_file($tmpPage)) {
+    my @commentNodes = $dom->getElementsByClassName('_4eek');
+    my $ind = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES');
+    # Parse each comment
+    foreach my $commentNode (@commentNodes) {
+      my ($id, $url, $name, $profileImg, $dateInt, $message, $depth);
+      my $profileNode = ($commentNode->getElementsByTagName('a'))[0];
+      # Get profil id, profil url, image url and name
+      $url = $profileNode->href;
+      if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+      $url = "https://www.facebook.com$url" if $url !~ /^http/;
+      if (my $dataHC = $profileNode->{'data-hovercard'}) {
+        if ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+      }
+      if (my $imageTag = ($profileNode->getElementsByTagName('img'))[0]) {
+        $profileImg = $imageTag->src;
+        $name       = $imageTag->{'alt'}
+      }
+      # Get comment date
+      my $commentTimestamp = ($commentNode->getElementsByTagName('abbr'))[0];
+      if ($commentTimestamp) {
+        $dateInt = $commentTimestamp->{'data-utime'};
+      }
+      # Get comment content
+      my $depthCode = $commentNode->getAttribute('data-testid');
+      if ($depthCode) { $depth = (split(/_/, $depthCode))[-1]; }
+      else { $depth = undef; }
+      if (my $tagText = ($commentNode->getElementsByClassName('_3l3x'))[0]) {
+        $message .= $tagText->innerHTML;
+        if (my @tagEmojis = $commentNode->getElementsByClassName('_5mfr')) {
+          foreach my $tagEmoji (@tagEmojis) {
+            my $tagEmojiCode = quotemeta($tagEmoji->innerHTML);
+            if (my $tagEmojiSpan = ($tagEmoji->getElementsByClassName('_6qdm'))[0]) {
+              my $emojiUrl;
+              if (my $styleAttr = $tagEmojiSpan->{style}) {
+                if ($styleAttr =~ /background-image: url\(\"([^\"]+)\"/) {
+                  $emojiUrl = $1;
+                  $sthCommentsFiles->execute($emojiUrl);
+                  $message =~ s/$tagEmojiCode/ <img src=\"$emojiUrl\">/;
+                }
+              }
+            }
+          }
+        }
+        $message =~ s/<[^>]*span[^>]*>//g; # Remove all span
+        if ($message =~ /(<a[^>]+hovercard[^>]+>[^<]+<\/a>)/) {
+          my $link = $1;
+          if ($link =~ /href=\"([^\"]+)[^>]+>([^<]+)<\/a>/) {
+            my $href = $1;
+            my $name = $2;
+            $link = quotemeta($link);
+            $href = "https://www.facebook.com$href" if $href !~ /^http/;
+            $message =~ s/$link/<a href="$href" target="_blank">$name<\/a>/;
+          }
+        }
+      }
+      if (my $tagImage = ($commentNode->getElementsByClassName('_2txe'))[0]) {
+        if (my $tagImageUrl = ($tagImage->getElementsByTagName('a'))[0] and my $tagImageImg = ($tagImage->getElementsByTagName('img'))[0]) {
+          my $url = $tagImageUrl->{href};
+          $url    =~ s/&amp;/&/g;
+          my $src = $tagImageImg->{src};
+          $src    =~ s/&amp;/&/g;
+          $sthCommentsFiles->execute($src);
+          $message .= "<a href=\"" . $url . "\" target=\"_blank\"><img src=\"" . $src . "\" alt=\"" . $tagImageImg->{alt} . "\"></a>";
+        }
+      }
+      if ($url and $id and $profileImg and $name and $name ne $$refInfos{filename} and $dateInt) {
+        # Profile already exists, count
+        if (my $exists = $$refDbh->selectrow_array('SELECT nbr FROM PROFILES WHERE cat == ? AND id = ?', undef,
+                                                   $STR{'Comments'}, $id)) {
+          $sthProfilesUpd->execute($exists+1, $STR{'Comments'}, $id);
+        # Add a new profile entry
+        } else {
+          $sthProfiles->execute($STR{'Comments'}, $id, $ind, $name, $url, $profileImg, 1);
+          $ind++;
+        }
+        # Add the message
+        $sthComments->execute($commentId, $id, $dateInt, $message, $currUrl, $depth);
+        $commentId++;
+      }
+    }
+    $$refDbh->commit();
+  }
+  
+}  #--- End parseComments
+
+#--------------------------#
+sub dlCommentsImg
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos) = @_;
+  my $imagePath = "$$refInfos{saveDir}\\images_$$refInfos{filename}";
+  mkdir($imagePath) if !-d $imagePath;
+  my $all = $$refDbh->selectall_arrayref('SELECT url FROM COMMENTS_FILES WHERE url IS NOT NULL');
+  my $sthCommentsFilesUpd = $$refDbh->prepare('UPDATE COMMENTS_FILES SET path = ?, relPath = ? WHERE url = ?');
+  # Turn on progress bar
+  my $count   = 0;
+  my $nbrToDL = scalar(@$all);
+  $winPb->pbWinPb2->SetRange(0, $nbrToDL);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text("$count/$nbrToDL");
+  $winPb->lblPbCurr2->Text("$STR{'Downloading'} $STR{'pictures'}...");
+  foreach my $entry (@$all) {
+    my $filename;
+    if ($$entry[0] =~ /safe_image\.php/ and $$entry[0] =~ /url=([^\&]+)/) {
+      my $url = unescape($1);
+      if ($url =~ /([^\/\?]+)$/) { $filename = $1; }
+    } elsif ($$entry[0] =~ /\/([^\/\?]+)(?:\?|$)/) { $filename = $1; }
+    if ($filename) {
+      my $path    = "$$refInfos{saveDir}\\images_$$refInfos{filename}\\$filename";
+      my $relPath = ".\\images_$$refInfos{filename}\\$filename";
+      my $maxAttempts = 2;
+      while (!-e $path and $maxAttempts) {
+        $$refMech->get($$entry[0]);
+        sleep($$refInfos{timeToWait});
+        $$refMech->saveResources_future(target_file => $path, target_dir  => $imagePath)->get();
+        if (my $content = $$refMech->{response}->{_content}) {
+          open(IMG, ">$path");
+          binmode(IMG);
+          print IMG $content;
+          close(IMG);
+        }
+        $maxAttempts--;
+      }
+      $sthCommentsFilesUpd->execute($path, $relPath, $$entry[0]);
+    }
+    $count++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$count/$nbrToDL");
+  }
+  $winPb->lblPbCurr2->Text('');
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  $$refDbh->commit();
+  
+}  #--- End dlCommentsImg
+
+#--------------------------#
+sub parseMutualFriends
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $cat) = @_;
+  my $encodedCatName = encode($$refInfos{charSet}, $cat);
+  my @members;
+  my $nbrMembers;
+  # Load content from file
+  if (-T $$refInfos{"$cat-tmpPage"}) {
+    my $dom = new HTML::DOM(charset => 'utf8');
+    if ($dom->parse_file($$refInfos{"$cat-tmpPage"})) {
+      @members    = $dom->getElementsByClassName('fbProfileBrowserListItem');
+      $nbrMembers = scalar(@members);
+    }
+  }
+  # Turn on progress bar
+  my $ind = 0;
+  $winPb->pbWinPb2->SetRange($ind, $nbrMembers);
+  $winPb->pbWinPb2->SetPos($ind);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("$ind/$nbrMembers");
+  my $sthProfiles = $$refDbh->prepare('INSERT OR REPLACE INTO PROFILES (cat,id,ind,name,url,details,pictureURL) VALUES(?,?,?,?,?,?,?)');
+  # Parse friends details
+  my $i = 0;
+  foreach my $member (@members) {
+    my ($url, $id, $name, $pictureURL);
+    # Get profil id, profil url, image url and name
+    if (my $memberLink = ($member->getElementsByTagName('a'))[0]) {
+      $url = $memberLink->href;
+      if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+      if (my $dataHC = $memberLink->{'data-hovercard'}) {
+        if ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+      }
+      if (my $imageTag = ($memberLink->getElementsByTagName('img'))[0]) {
+        $pictureURL = $imageTag->src;
+        $name       = $imageTag->{'aria-label'}
+      } else { $name = undef; }
+    }
+    # Minimum details required
+    if ($url and $id and $pictureURL) {
+      $sthProfiles->execute($cat, $id, $ind, $name, $url, undef, $pictureURL);
+      $ind++;
+    }
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$i/$nbrMembers");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End parseMutualFriends
+
+#--------------------------#
+sub parseGroupMembers
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos) = @_;
+  my @members;
+  # Load content from file
+  if (-T $$refInfos{tmpPage}) {
+    my $dom = new HTML::DOM(charset => 'utf8');
+    if ($dom->parse_file($$refInfos{tmpPage})) {
+      @members = $dom->getElementsByClassName('_60rh');
+    }
+  }
+  # Turn on progress bar
+  my $ind        = 0;
+  my $nbrMembers = scalar(@members);
+  $winPb->pbWinPb2->SetRange($ind, $nbrMembers);
+  $winPb->pbWinPb2->SetPos($ind);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("$ind/$nbrMembers");
+  my $sthProfiles = $$refDbh->prepare('INSERT OR REPLACE INTO PROFILES (cat,id,ind,name,url,details,pictureURL) VALUES(?,?,?,?,?,?,?)');
+  # Parse friends details
+  my $i = 0;
+  foreach my $member (@members) {
+    my ($cat, $url, $id, $name, $details, $pictureURL);
+    # Category
+    if (my $catID = $member->{id}) {
+      if    ($catID =~ /admins/      ) { $cat = $STR{'Admins'}; }
+      elsif ($catID =~ /page_members/) { $cat = $STR{'Pages'};  }
+    }
+    $cat = $STR{'Members'} if !$cat;
+    # Get profil id, profil url, image url and name
+    if (my $memberLink = ($member->getElementsByTagName('a'))[0]) {
+      $url = $memberLink->href;
+      if ($url =~ /(.+?)[\?\&]fref/) { $url = $1; }
+      if ($url =~ /(.+?)[\?\&]ref/ ) { $url = $1; } # Page
+      if (my $dataHC = $memberLink->{'data-hovercard'}) {
+        if    ($dataHC =~ /hovercard\/user.php\?id=([^\&\"]+)/) { $id = $1; }
+        elsif ($dataHC =~ /hovercard\/page.php\?id=([^\&\"]+)/) { $id = $1; } # Page
+      }
+      if (my $imageTag = ($memberLink->getElementsByTagName('img'))[0]) {
+        $pictureURL = $imageTag->src;
+        $name       = $imageTag->{'aria-label'}
+      } else { $name = undef; }
+    }
+    if (my @detailParts = $member->getElementsByClassName('_60rj')) {
+      foreach my $detailPart (@detailParts) {
+        if (my $tmpText = $detailPart->innerHTML) {
+          if ($tmpText =~ /<abbr/ and $tmpText =~ /title=\"([^\"]+)\"/) {
+            my $dateStr = $1;
+            $details .= ', ' if $details;
+            $details .= "$STR{'Joined'} $dateStr";
+          } else {
+            $details .= ', ' if $details;
+            $details .= $tmpText;
+          }
+        }
+      }
+      $details =~ s/<[^>]+>//g if $details;
+    }
+    $details = undef if !$details;
+    # Minimum details required
+    if ($cat and $url and $id and $pictureURL) {
+      $sthProfiles->execute($cat, $id, $ind, $name, $url, $details, $pictureURL);
+      $ind++;
+      $$refInfos{nbrMembers}++;
+    }
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$i/$nbrMembers");
+  }
+  $$refDbh->commit();
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  
+}  #--- End parseGroupMembers
+
+#--------------------------#
+sub dlProfilesIcons
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refDbh, $refInfos, $cat) = @_;
+  my $imagePath = "$$refInfos{saveDir}\\images_$$refInfos{filename}";
+  mkdir($imagePath) if !-d $imagePath;
+  my $all;
+  if ($cat) { $all = $$refDbh->selectall_arrayref('SELECT id,pictureURL FROM PROFILES WHERE pictureURL IS NOT NULL AND cat IS ?', undef, $cat); }
+  else      { $all = $$refDbh->selectall_arrayref('SELECT id,pictureURL FROM PROFILES WHERE pictureURL IS NOT NULL');                           }
+  # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+  my $sthProfilesUpd = $$refDbh->prepare('UPDATE PROFILES SET picturePath = ?, pictureRelPath = ? WHERE id = ?');
+  # Turn on progress bar
+  my $count   = 0;
+  my $nbrToDL = scalar(@$all);
+  $winPb->pbWinPb2->SetRange(0, $nbrToDL);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+  $winPb->lblCount2->Text("$count/$nbrToDL");
+  $winPb->lblPbCurr2->Text("$STR{'Downloading'} $STR{'profileIcons'}...");
+  foreach my $entry (@$all) {
+    my $path    = "$$refInfos{saveDir}\\images_$$refInfos{filename}\\$$entry[0]\.jpg";
+    my $relPath = ".\\images_$$refInfos{filename}\\$$entry[0]\.jpg";
+    my $maxAttempts = 2;
+    while (!-e $path and $maxAttempts) {
+      $$refMech->get($$entry[1]);
+      sleep($$refInfos{timeToWait});
+      $$refMech->saveResources_future(target_file => $path, target_dir => $imagePath)->get();
+      if (my $content = $$refMech->{response}->{_content}) {
+        open(IMG, ">$path");
+        binmode(IMG);
+        print IMG $content;
+        close(IMG);
+      }
+      $maxAttempts--;
+    }
+    $sthProfilesUpd->execute($path, $relPath, $$entry[0]);
+    $count++;
+    $winPb->pbWinPb2->StepIt();
+    $winPb->lblCount2->Text("$count/$nbrToDL");
+  }
+  $winPb->lblPbCurr2->Text('');
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->lblCount2->Text('');
+  $$refDbh->commit();
+  
+}  #--- End dlProfilesIcons
+
+#--------------------------#
+sub createAlbumReportHTML
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos) = @_;
+  # Create the HTML Album page
+  my $htmlAlbumPage = "$$refInfos{saveDir}\\$$refInfos{filename}.html";
+  $$refInfos{filename} = encode('utf8', $$refInfos{filename});
+  if (open(HTML, ">:encoding(utf8)", $htmlAlbumPage)) {
+    print HTML "<!DOCTYPE html>\n";
+    print HTML "<html>\n<head>\n<title>$$refInfos{filename}</title>\n";
+    print HTML "<meta charset=\"utf8\">\n";
+    print HTML "<meta name=\"generator\" content=\"DumpItBlue $VERSION\">\n";
+    print HTML "<style>\n";
+    print HTML "table, th, td {\n";
+    print HTML "  border: 1px solid black;\n";
+    print HTML "  border-collapse: collapse;\n";
+    print HTML "}\n";
+    print HTML "th, td {\n";
+    print HTML "  padding: 5px;\n";
+    print HTML "}\n";
+    print HTML "</style>\n";
+    print HTML "</head>\n";
+    print HTML "<body>\n";
+    print HTML "<h1 style=\"color:#003300;font-size: 18pt;font-variant: small-caps;font-weight: bold;\;text-align: center;\">";
+    print HTML "$$refInfos{filename}</h1>\n";
+    print HTML "<table style=\"margin: auto;\">\n";
+    # List of Albums
+    my $refAllAlbums = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+    # $$refAllAlbums: 0 = Album id, 1 = name, 2 = url, 3 = tmpPage, 4 = path, 5 = nbrPics, 6 = step
+    my $nbrAlbums    = scalar(@$refAllAlbums);
+    # Turn on progress bar
+    my $count1 = 0;
+    $winPb->pbWinPb1->SetRange(0, $nbrAlbums);
+    $winPb->pbWinPb1->SetPos(0);
+    $winPb->pbWinPb1->SetStep(1);
+    $winPb->lblCount1->Text("$count1/$nbrAlbums");
+    # For each album
+    foreach my $albumEntry (sort @$refAllAlbums) {
+      print HTML "<tr><th colspan=4 style=\"height: 50px; color:#003300; background-color:#EEEEEE; font-size: 14pt; font-variant: ";
+      print HTML "small-caps; font-weight: bold;\">$$albumEntry[1]</th></tr>";
+      my $sthAllAlbumPictures = $$refDbh->prepare('SELECT * FROM PICTURES WHERE album = ? ORDER BY ind');
+      # PICTURES fields: 0=album, 1=ind, 2=pageURL, 3=pubDate, 4=smallName, 5=smallURL, 6=smallPath, 7=smallRelPath, 8=largeName,
+      #                  9=largeURL, 10=largePath, 11=largeRelPath, 12=videoName, 13=videoURL, 14=videoPath, 15=videoRelPath
+      $sthAllAlbumPictures->execute($$albumEntry[0]);
+      my $countRowPics = 0; # 4 pics by row
+      # Turn on progress bar
+      my $count2 = 0;
+      my $nbrAlbumPictures = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $$albumEntry[0]);
+      my $encodedAlbumName = encode($$refInfos{charSet}, $$albumEntry[1]);
+      $winPb->pbWinPb2->SetRange(0, $nbrAlbumPictures);
+      $winPb->pbWinPb2->SetPos(0);
+      $winPb->pbWinPb2->SetStep(1);
+      $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+      $winPb->lblPbCurr2->Text($encodedAlbumName);
+      while (my $entry = $sthAllAlbumPictures->fetchrow_arrayref()) {
+        print HTML "<tr>\n" if !$countRowPics; # new row for each group of 4 pics
+        print HTML "<td style=\"width: 25%; font-size: 11pt;text-align: center;\">\n";
+        # Link:
+        if      ($$entry[14] and $$entry[15] and -e $$entry[14]) { # Video
+          print HTML "<a href=\"$$entry[15]\">\n";
+        } elsif ($$entry[10] and $$entry[11] and -e $$entry[10]) { # Large pic
+          print HTML "<a href=\"$$entry[11]\">\n";
+        } else { print HTML "<a href=\"$$entry[2]\">\n"; } # Small pic (link is a url)
+        # Image
+        if      ($$entry[6] and $$entry[7] and -e $$entry[6]) { # Small pic
+          print HTML "<img src=\"$$entry[7]\" alt=\"$$entry[4]\" style=\"max-width:200px;\">\n";
+        } elsif ($$entry[10] and $$entry[11] and -e $$entry[10]) { # Large pic
+          print HTML "<img src=\"$$entry[11]\" alt=\"$$entry[8]\" style=\"max-width:200px;\">\n";
+        } else { print HTML "<img src=\"$$entry[5]\" alt=\"\" style=\"max-width:200px;\">\n"; } # Image is a link to the small pic
+        print HTML "</a><br><br>\n";
+        if ($$entry[3] and $$entry[3] ne '-') {
+          my $dateStr = &formatDate($$entry[3]);
+          print HTML "Date: <strong style=\"color:#339900;\">$dateStr</strong>\n";
+        }
+        print HTML "</td>\n";
+        $countRowPics++;
+        if ($countRowPics == 4) { print HTML "</tr>\n"; $countRowPics = 0; } # End row
+        # Update progress
+        $count2++;
+        $winPb->pbWinPb2->StepIt();
+        $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+      }
+      # Complete row (last row is not 4 pics)
+      if ($countRowPics != 0) {
+        while ($countRowPics != 4) { print HTML "<td>&nbsp;</td>\n"; $countRowPics++; }
+      }
+      # Update progress
+      $count1++;
+      $winPb->pbWinPb1->StepIt();
+      $winPb->lblCount1->Text("$count1/$nbrAlbums");
+    }
+    print HTML "</table>\n</body>\n</html>\n";
+    close(HTML);
+    return($htmlAlbumPage);
+  }
+  return(0);
+  
+}  #--- End createAlbumReportHTML
+
+#--------------------------#
+sub createAlbumReportXLSX
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos) = @_;
+  my $refAllAlbums = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+  # $$refAllAlbums: 0 = Album id, 1 = name, 2 = url, 3 = tmpPage, 4 = path, 5 = nbrPics, 6 = step
+  my $nbrAlbums = scalar(@$refAllAlbums);
+  my $filename  = "$$refInfos{saveDir}\\$$refInfos{filename}\.xlsx";
+  my $excel;
+  my $count = 1;
+  while (!($excel = Excel::Writer::XLSX->new($filename))) { # If file is already open, must be renamed
+    $filename = "$$refInfos{saveDir}\\$$refInfos{filename} [".$count++."]\.xlsx";
+    last if $count == 10; # Stop after 10 attempts
+  }
+  if ($excel) {
+    # Set metadata
+    $excel->set_properties(title => $$refInfos{filename}, comments => 'DumpItBlue '.$VERSION);
+    # Turn on progress bar
+    my $count1 = 0;
+    $winPb->lblCount1->Text("0/$nbrAlbums");
+    $winPb->pbWinPb1->SetRange(0, $nbrAlbums);
+    $winPb->pbWinPb1->SetPos(0);
+    $winPb->pbWinPb1->SetStep(1);
+    # One sheet per category
+    foreach my $albumEntry (sort @$refAllAlbums) {
+      # Progress 1
+      my $encodedAlbumName = encode($$refInfos{charSet}, $$albumEntry[1]);
+      $winPb->lblPbCurr2->Text("$STR{'Creating'} $STR{'sheet'}: $encodedAlbumName");
+      # Create a sheet by category
+      my $sheetName = substr($encodedAlbumName, 0, 31);
+      if (my $sheet = $excel->add_worksheet($sheetName)) {
+        &createAlbumReportXLSXSheet(\$excel, \$sheet, $refDbh, $refInfos, $albumEntry);
+      }
+      # Progress 1
+      $count1++;
+      $winPb->lblCount1->Text("$count1/$nbrAlbums");
+      $winPb->pbWinPb1->StepIt();
+    }
+    $excel->close();
+    return($filename);
+  }
+  
+}  #--- End createAlbumReportXLSX
+
+#--------------------------#
+sub createAlbumReportXLSXSheet
+#--------------------------#
+{
+  # Local variables
+  my ($refExcel, $refSheet, $refDbh, $refInfos, $albumEntry) = @_;
+  my $nbrAlbumPictures    = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $$albumEntry[0]);
+  my $sthAllAlbumPictures = $$refDbh->prepare('SELECT * FROM PICTURES WHERE album = ? ORDER BY ind');
+  # PICTURES fields: 0=album, 1=ind, 2=pageURL, 3=pubDate, 4=smallName, 5=smallURL, 6=smallPath, 7=smallRelPath, 8=largeName,
+  #                  9=largeURL, 10=largePath, 11=largeRelPath, 12=videoName, 13=videoURL, 14=videoPath, 15=videoRelPath
+  $sthAllAlbumPictures->execute($$albumEntry[0]);
+  # Progress 2
+  $winPb->lblPbCurr2->Text('');
+  $winPb->pbWinPb2->SetRange(0, $nbrAlbumPictures);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+	$winPb->lblCount2->Text("0/$nbrAlbumPictures");
+  my $count2 = 0;
+  # Formats
+  my $format  = $$refExcel->add_format(valign => 'vcenter', align => 'center', bold => 1);
+  my $format2 = $$refExcel->add_format(valign => 'vcenter', align => 'center');
+  my $j = 0; # Column no
+  # Headers
+  $$refSheet->write_string(0, $j, $STR{'albumNames'} , $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'albumID'}    , $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'albumURLs'}  , $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'pictureID'}  , $format); $j++;
+  if ($$refInfos{incPublishDate}) { $$refSheet->write_string(0, $j, $STR{'chPublishDate'}, $format ); $j++; }
+  $$refSheet->write_string(0, $j, $STR{'picturePage'}, $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'smallPicURL'}, $format); $j++;
+  if ($$refInfos{incLargePics}) { $$refSheet->write_string(0, $j, $STR{'largePicURL'}, $format); $j++; }
+  # Create content
+  my $i = 1; # Row no
+  my $maxWidthCol1 = length($STR{'albumNames'}   )+5;
+  my $maxWidthCol2 = length($STR{'albumID'}      )+5;
+  my $maxWidthCol3 = length($STR{'albumURLs'}    )+5;
+  my $maxWidthCol4 = length($STR{'pictureID'}    )+5;
+  my $maxWidthCol5 = length($STR{'chPublishDate'})+5;
+  my $maxWidthCol6 = length($STR{'picturePage'}  )+5;
+  my $maxWidthCol7 = length($STR{'smallPicURL'}  )+5;
+  my $maxWidthCol8 = length($STR{'largePicURL'}  )+5;
+  while (my $entry = $sthAllAlbumPictures->fetchrow_arrayref()) {
+    $j = 0;
+    # Album Name
+    $$refSheet->write_string($i, $j, $$albumEntry[1]);
+    $maxWidthCol1 = length($$albumEntry[1]) if length($$albumEntry[1]) > $maxWidthCol1;
+    $j++;
+    # Album ID
+    $$refSheet->write_string($i, $j, $$albumEntry[0]);
+    $maxWidthCol2 = length($$albumEntry[0]) if length($$albumEntry[0]) > $maxWidthCol2;
+    $j++;
+    # Album URL
+    $$refSheet->write_string($i, $j, $$albumEntry[2]);
+    $maxWidthCol3 = length($$albumEntry[2]) if length($$albumEntry[2]) > $maxWidthCol3;
+    $j++;
+    # Picture ID
+    if ($$entry[2] =~ /fbid=(\d+)/ or $$entry[2] =~ /\/vb\.\d+\/(\d+)\// or $$entry[2] =~ /\/a\.$$albumEntry[0]\.\d+\.\d+\/(\d+)\//) {
+      $$refSheet->write_string($i, $j, $1);
+      $maxWidthCol4 = length($1) if length($1) > $maxWidthCol4;
+    }
+    $j++;
+    # Publication date
+    if ($$refInfos{incPublishDate}) {
+      if ($$entry[3]) {
+        my $dateStr = &formatDate($$entry[3]);
+        $$refSheet->write_string($i, $j, $dateStr);
+        $maxWidthCol5 = length($dateStr) if length($dateStr) > $maxWidthCol5;
+      }
+      $j++;
+    }
+    # Picture Page URL
+    $$refSheet->write_string($i, $j, $$entry[2]);
+    $maxWidthCol6 = length($$entry[2]) if length($$entry[2]) > $maxWidthCol6;
+    $j++;
+    # Small Pic URL
+    $$refSheet->write_string($i, $j, $$entry[5]);
+    $maxWidthCol7 = length($$entry[5]) if length($$entry[5]) > $maxWidthCol7;
+    $j++;
+    # Large Pic or Video URL
+    my $value;
+    if    ($$entry[9] ) { $value = $$entry[9];  } # Large Pic URL
+    elsif ($$entry[13]) { $value = $$entry[13]; } # Video URL
+    if ($value) {
+      $$refSheet->write_string($i, $j, $value);
+      $maxWidthCol8 = length($value) if length($value) > $maxWidthCol8;
+    }
+    # Progress
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $count2++;
+    $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+  }
+  # Ajust column sizes
+  $j = 0;
+  $$refSheet->set_column($j, $j, $maxWidthCol1); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol2); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol3); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol4); $j++;
+  if ($$refInfos{incPublishDate}) { $$refSheet->set_column($j, $j, $maxWidthCol5); $j++; }
+  $$refSheet->set_column($j, $j, $maxWidthCol6); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol7); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol8);
+  # Set autofilter
+  $$refSheet->autofilter(0, 0, 0, $j);
+  $$refSheet->freeze_panes(1, 0);
+
+}  #--- End createAlbumReportXLSXSheet
+
+#--------------------------#
+sub createAlbumReportTXT
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos) = @_;
+  my $filename     = "$$refInfos{saveDir}\\$$refInfos{filename}\.txt";
+  my $refAllAlbums = $$refDbh->selectall_arrayref('SELECT * FROM ALBUMS');
+  # $$refAllAlbums: 0 = Album id, 1 = name, 2 = url, 3 = tmpPage, 4 = path, 5 = nbrPics, 6 = step
+  my $nbrAlbums    = scalar(@$refAllAlbums);
+  # Turn on progress bar
+  my $count1 = 0;
+  $winPb->lblCount1->Text("0/$nbrAlbums");
+  $winPb->pbWinPb1->SetRange(0, $nbrAlbums);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'textFile'}");
+  if (open(my $txt, ">:encoding(utf8)", $filename)) {
+    # Header
+    print $txt "$STR{'albumNames'}\t$STR{'albumID'}\t$STR{'albumURLs'}\t$STR{'pictureID'}\t";
+    print $txt "$STR{'chPublishDate'}\t" if $$refInfos{incPublishDate};
+    print $txt "$STR{'picturePage'}\t$STR{'smallPicURL'}";
+    print $txt "\t$STR{'largePicURL'}" if $$refInfos{incLargePics};
+    print $txt "\n";
+    foreach my $albumEntry (sort @$refAllAlbums) {
+      # Turn on progress bar
+      my $nbrAlbumPictures = $$refDbh->selectrow_array('SELECT COUNT(ind) FROM PICTURES WHERE album = ?', undef, $$albumEntry[0]);
+      my $encodedAlbumName = encode($$refInfos{charSet}, $$albumEntry[0]);
+      $winPb->lblPbCurr2->Text("$STR{'Creating'} $STR{'page'}: $encodedAlbumName");
+      $winPb->pbWinPb2->SetRange(0, $nbrAlbumPictures);
+      $winPb->pbWinPb2->SetPos(0);
+      $winPb->pbWinPb2->SetStep(1);
+      $winPb->lblCount2->Text("0/$nbrAlbumPictures");
+      my $count2 = 0;
+      # Select all pictures/videos for this album
+      my $sthAllAlbumPictures = $$refDbh->prepare('SELECT * FROM PICTURES WHERE album = ? ORDER BY ind');
+      # PICTURES fields: 0=album, 1=ind, 2=pageURL, 3=pubDate, 4=smallName, 5=smallURL, 6=smallPath, 7=smallRelPath, 8=largeName,
+      #                  9=largeURL, 10=largePath, 11=largeRelPath, 12=videoName, 13=videoURL, 14=videoPath, 15=videoRelPath
+      $sthAllAlbumPictures->execute($$albumEntry[0]);
+      while (my $entry = $sthAllAlbumPictures->fetchrow_arrayref()) {
+        print $txt "$$albumEntry[1]\t".$$albumEntry[0]."\t".$$albumEntry[2]."\t";
+        if ($$entry[2] =~ /fbid=(\d+)/ or $$entry[2] =~ /\/vb\.\d+\/(\d+)\// or
+            $$entry[2] =~ /\/a\.$$albumEntry[0]\.\d+\.\d+\/(\d+)\//) { print $txt "$1\t"; }
+        else { print $txt "\t"; }
+        if ($$refInfos{incPublishDate}) {
+          if ($$entry[3]) {
+            my $dateStr = &formatDate($$entry[3]);
+            print $txt $dateStr;
+          }
+          print $txt "\t";
+        }
+        print $txt "$$entry[2]\t$$entry[5]\t";
+        if    ($$entry[9] ) { print $txt $$entry[9];  } # Large Pic URL
+        elsif ($$entry[13]) { print $txt $$entry[13]; } # Video URL
+        print $txt "\n";
+        $count2++;
+        $winPb->pbWinPb2->StepIt();
+        $winPb->lblCount2->Text("$count2/$nbrAlbumPictures");
+      }
+      $count1++;
+      $winPb->lblCount1->Text("$count1/$nbrAlbums");
+      $winPb->pbWinPb1->StepIt();
+    }
+    close($txt);
+    return($filename);
+  }
+  
+}  #--- End createAlbumReportTXT
+
+#--------------------------#
+sub createProfilesReportXLSX
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $type) = @_;
+  # Type: 1=DumpFriends, 2=DumpContrib, 3=DumpGroupMembers
+  my $refListCat = $$refDbh->selectall_arrayref('SELECT DISTINCT(cat) FROM PROFILES');
+  my $nbrItems   = scalar(@$refListCat);
+  my $filename   = "$$refInfos{saveDir}\\$$refInfos{filename}\.xlsx";
+  my $excel;
+  my $count = 1;
+  while (!($excel = Excel::Writer::XLSX->new($filename))) { # If file is already open, must be renamed
+    $filename = "$$refInfos{saveDir}\\$$refInfos{filename} [".$count++."]\.xlsx";
+    last if $count == 10; # Stop after 10 attempts
+  }
+  if ($excel) {
+    # Set metadata
+    $excel->set_properties(title => $$refInfos{filename}, comments => 'DumpItBlue '.$VERSION);
+    # Turn on progress bar
+    my $count1 = 0;
+    $winPb->lblCount1->Text("0/$nbrItems");
+    $winPb->pbWinPb1->SetRange(0, $nbrItems);
+    $winPb->pbWinPb1->SetPos(0);
+    $winPb->pbWinPb1->SetStep(1);
+    # One sheet per category
+    foreach my $cat (sort @$refListCat) {
+      # Progress 1
+      my $encodedName = encode($$refInfos{charSet}, $$cat[0]);
+      $winPb->lblPbCurr2->Text("$STR{'Creating'} $STR{'sheet'}: $encodedName");
+      # Create a sheet by category
+      my $sheetName = substr($encodedName, 0, 31);
+      if (my $sheet = $excel->add_worksheet($sheetName)) {
+        my $sthAll;
+        if ($type == 2) { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY nbr DESC'); }
+        else            { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY ind');      }
+        # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+        $sthAll->execute($$cat[0]);
+        my $nbrItems      = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES WHERE cat = ?', undef, $$cat[0]);
+        my $detailsExists = $$refDbh->selectrow_array('SELECT COUNT(details) FROM PROFILES WHERE details IS NOT NULL'); # details exists?
+        my $countExists   = $$refDbh->selectrow_array('SELECT COUNT(nbr) FROM PROFILES WHERE nbr IS NOT NULL'); # Count exists? (For contributors)
+        # Turn on progress bar
+        $winPb->lblPbCurr2->Text('');
+        $winPb->pbWinPb2->SetRange(0, $nbrItems);
+        $winPb->pbWinPb2->SetPos(0);
+        $winPb->pbWinPb2->SetStep(1);
+        $winPb->lblCount2->Text("0/$nbrItems");
+        my $count2 = 0;
+        # Formats
+        my $format  = $excel->add_format(valign => 'vcenter', align => 'center', bold => 1);
+        my $format2 = $excel->add_format(valign => 'vcenter', align => 'center');
+        my $format3 = $excel->add_format(valign => 'top');
+        # Cat url
+        my $originURL = '-';
+        if    ($$refInfos{"$$cat[0]-url"} ) { $originURL = $$refInfos{"$$cat[0]-url"}; }
+        elsif ($$refInfos{startingURL}    ) { $originURL = $$refInfos{startingURL};    }
+        else                                { $originURL = '-'                         }
+        # Headers
+        my $j = 0; # Column no
+        if ($$refInfos{incIcons}) { $sheet->write_string(0, $j, $STR{'Image'}, $format ); $j++; }
+        $sheet->write_string(0, $j, $STR{'ProfileID'}, $format); $j++;
+        $sheet->write_string(0, $j, $STR{'url'}      , $format); $j++;
+        $sheet->write_string(0, $j, $STR{'Name'}     , $format); $j++;
+        if ($detailsExists) {
+          $sheet->write_string(0, $j, $STR{'Details'}, $format ); $j++;
+        }
+        $sheet->write_string(0, $j, $STR{'imgPath2'} , $format); $j++;
+        $sheet->write_string(0, $j, $STR{'originURL'}, $format); $j++;
+        if ($countExists) { $sheet->write(0, $j, $STR{'Count'}, $format ); $j++; }
+        # Create content
+        my $i = 1; # Row no
+        my $maxWidthCol1 = 5;
+        my $maxWidthCol2 = 0;
+        my $maxWidthCol3 = 0;
+        my $maxWidthCol4 = 0;
+        my $maxWidthCol5 = 0;
+        my $maxWidthCol6 = 100;
+        my $maxWidthCol7 = length($STR{'originURL'})+3;
+        my $maxWidthCol8 = length($STR{'Count'})+3;
+        while (my $entry = $sthAll->fetchrow_arrayref()) {
+          $j = 0;
+          # Image column
+          if ($$refInfos{incIcons}) {
+            my $info = image_info($$entry[7]);
+            if (!$info->{error}) { # Insert only if image is not corrupted
+              $sheet->insert_image($i, $j, $$entry[7]); # Ignore if not a valid image
+              if ($info->{height}) {
+                my $colHeight = $info->{height} / 1.33;
+                $sheet->set_row($i, $colHeight);
+              }
+              else { $sheet->set_row($i, 30); }
+              if ($info->{width}) {
+                my $colWidth = $info->{width} / 7.2;
+                $maxWidthCol1 = $colWidth if $colWidth > $maxWidthCol1;
+              }
+            }
+            $j++;
+          }
+          # Profile ID column
+          $sheet->write_string($i, $j, $$entry[1]);
+          $sheet->set_column($j, 6, undef, $format3);
+          $maxWidthCol2 = length($$entry[1]) if length($$entry[1]) > $maxWidthCol2;
+          $j++;
+          # URL column
+          $sheet->write_string($i, $j, $$entry[4]);
+          $maxWidthCol3 = length($$entry[4]) if length($$entry[4]) > $maxWidthCol3;
+          $j++;
+          # Name column
+          if ($$entry[3]) {
+            $sheet->write_string($i, $j, $$entry[3]);
+            $maxWidthCol4 = length($$entry[3]) if length($$entry[3]) > $maxWidthCol4;
+          }
+          $j++;
+          # Profile Details column
+          if ($detailsExists) {
+            if ($$entry[5]) {
+              $$entry[5] = decode_entities($$entry[5]);
+              $sheet->write_string($i, $j, $$entry[5]);
+              $maxWidthCol5 = length($$entry[5]) if length($$entry[5]) > $maxWidthCol5;
+            }
+            $j++;
+          }
+          # Image Path or URL column
+          $sheet->write_string($i, $j, $$entry[6]) if $$entry[6];
+          $j++;
+          # Original URL column
+          $sheet->write_string($i, $j, $originURL);
+          $maxWidthCol7 = length($originURL) if length($originURL) > $maxWidthCol7;
+          $j++;
+          # Count column
+          if ($countExists) {
+            $sheet->write($i, $j, $$entry[9]) if $$entry[9];
+            $j++;
+          }
+          # Progress
+          $i++;
+          $winPb->pbWinPb2->StepIt();
+          $count2++;
+          $winPb->lblCount2->Text("$count2/$nbrItems");
+        }
+        # Ajust column sizes
+        $j = 0;
+        if ($$refInfos{incIcons}) { $sheet->set_column(0, 0, $maxWidthCol1, $format2); $j++; }
+        $sheet->set_column($j, $j, $maxWidthCol2); $j++;
+        $sheet->set_column($j, $j, $maxWidthCol3); $j++;
+        $sheet->set_column($j, $j, $maxWidthCol4); $j++;
+        if ($detailsExists) { $sheet->set_column($j, $j, $maxWidthCol5); $j++; }
+        $sheet->set_column($j, $j, $maxWidthCol6); $j++;
+        $sheet->set_column($j, $j, $maxWidthCol7); $j++;
+        $sheet->set_column($j, $j, $maxWidthCol8); $j++;
+      }
+      # Progress 1
+      $count1++;
+      $winPb->lblCount1->Text("$count1/$nbrItems");
+      $winPb->pbWinPb1->StepIt();
+    }
+    $excel->close();
+    return($filename);
+  }
+  
+}  #--- End createProfilesReportXLSX
+
+#--------------------------#
+sub createProfilesReportXLSXSheet
+#--------------------------#
+{
+  # Local variables
+  my ($refExcel, $refSheet, $refDbh, $refInfos, $cat, $type) = @_;
+  # Type: 1=DumpFriends, 2=DumpContrib, 4=DumpGroupMembers
+  my $sthAll;
+  if ($type == 2) { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY nbr DESC'); }
+  else            { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY ind');      }
+  # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+  $sthAll->execute($cat);
+  my $nbrItems      = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES WHERE cat = ?', undef, $cat);
+  my $detailsExists = $$refDbh->selectrow_array('SELECT COUNT(details) FROM PROFILES WHERE details IS NOT NULL'); # details exists?
+  my $countExists   = $$refDbh->selectrow_array('SELECT COUNT(nbr) FROM PROFILES WHERE nbr IS NOT NULL'); # Count exists? (For contributors)
+  # Turn on progress bar
+  $winPb->lblPbCurr2->Text('');
+  $winPb->pbWinPb2->SetRange(0, $nbrItems);
+  $winPb->pbWinPb2->SetPos(0);
+  $winPb->pbWinPb2->SetStep(1);
+	$winPb->lblCount2->Text("0/$nbrItems");
+  my $count2 = 0;
+  # Formats
+  my $format  = $$refExcel->add_format(valign => 'vcenter', align => 'center', bold => 1);
+  my $format2 = $$refExcel->add_format(valign => 'vcenter', align => 'center');
+  my $format3 = $$refExcel->add_format(valign => 'top');
+  # Cat url
+  my $originURL = '-';
+  if    ($$refInfos{"$cat-url"} ) { $originURL = $$refInfos{"$cat-url"};  }
+  elsif ($$refInfos{startingURL}) { $originURL = $$refInfos{startingURL}; }
+  else                            { $originURL = '-'                      }
+  # Headers
+  my $j = 0; # Column no
+  if ($$refInfos{incIcons}) { $$refSheet->write_string(0, $j, $STR{'Image'}, $format ); $j++; }
+  $$refSheet->write_string(0, $j, $STR{'ProfileID'}, $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'url'}      , $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'Name'}     , $format); $j++;
+  if ($detailsExists) {
+    $$refSheet->write_string(0, $j, $STR{'Details'}, $format ); $j++;
+  }
+  $$refSheet->write_string(0, $j, $STR{'imgPath2'} , $format); $j++;
+  $$refSheet->write_string(0, $j, $STR{'originURL'}, $format); $j++;
+  if ($countExists) { $$refSheet->write(0, $j, $STR{'Count'}, $format ); $j++; }
+  # Create content
+  my $i = 1; # Row no
+  my $maxWidthCol1 = 5;
+  my $maxWidthCol2 = 0;
+  my $maxWidthCol3 = 0;
+  my $maxWidthCol4 = 0;
+  my $maxWidthCol5 = 0;
+  my $maxWidthCol6 = 100;
+  my $maxWidthCol7 = length($STR{'originURL'})+3;
+  my $maxWidthCol8 = length($STR{'Count'})+3;
+  while (my $entry = $sthAll->fetchrow_arrayref()) {
+    $j = 0;
+    # Image column
+    if ($$refInfos{incIcons}) {
+      my $info = image_info($$entry[7]);
+      if (!$info->{error}) { # Insert only if image is not corrupted
+        $$refSheet->insert_image($i, $j, $$entry[7]); # Ignore if not a valid image
+        if ($info->{height}) {
+          my $colHeight = $info->{height} / 1.33;
+          $$refSheet->set_row($i, $colHeight);
+        }
+        else { $$refSheet->set_row($i, 30); }
+        if ($info->{width}) {
+          my $colWidth = $info->{width} / 7.2;
+          $maxWidthCol1 = $colWidth if $colWidth > $maxWidthCol1;
+        }
+      }
+      $j++;
+    }
+    # Profile ID column
+    $$refSheet->write_string($i, $j, $$entry[1]);
+    $$refSheet->set_column($j, 6, undef, $format3);
+    $maxWidthCol2 = length($$entry[1]) if length($$entry[1]) > $maxWidthCol2;
+    $j++;
+    # URL column
+    $$refSheet->write_string($i, $j, $$entry[4]);
+    $maxWidthCol3 = length($$entry[4]) if length($$entry[4]) > $maxWidthCol3;
+    $j++;
+    # Name column
+    if ($$entry[3]) {
+      $$refSheet->write_string($i, $j, $$entry[3]);
+      $maxWidthCol4 = length($$entry[3]) if length($$entry[3]) > $maxWidthCol4;
+    }
+    $j++;
+    # Profile Details column
+    if ($detailsExists) {
+      if ($$entry[5]) {
+        $$entry[5] = decode_entities($$entry[5]);
+        $$refSheet->write_string($i, $j, $$entry[5]);
+        $maxWidthCol5 = length($$entry[5]) if length($$entry[5]) > $maxWidthCol5;
+      }
+      $j++;
+    }
+    # Image Path or URL column
+    $$refSheet->write_string($i, $j, $$entry[6]) if $$entry[6];
+    $j++;
+    # Original URL column
+    $$refSheet->write_string($i, $j, $originURL);
+    $maxWidthCol7 = length($originURL) if length($originURL) > $maxWidthCol7;
+    $j++;
+    # Count column
+    if ($countExists) {
+      $$refSheet->write($i, $j, $$entry[9]) if $$entry[9];
+      $j++;
+    }
+    # Progress
+    $i++;
+    $winPb->pbWinPb2->StepIt();
+    $count2++;
+    $winPb->lblCount2->Text("$count2/$nbrItems");
+  }
+  # Ajust column sizes
+  $j = 0;
+  if ($$refInfos{incIcons}) { $$refSheet->set_column(0, 0, $maxWidthCol1, $format2); $j++; }
+  $$refSheet->set_column($j, $j, $maxWidthCol2); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol3); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol4); $j++;
+  if ($detailsExists) { $$refSheet->set_column($j, $j, $maxWidthCol5); $j++; }
+  $$refSheet->set_column($j, $j, $maxWidthCol6); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol7); $j++;
+  $$refSheet->set_column($j, $j, $maxWidthCol8); $j++;
+
+}  #--- End createProfilesReportXLSXSheet
+
+#--------------------------#
+sub createProfilesReportHTML
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $type) = @_;
+  # Type: 1=DumpFriends, 2=DumpContrib, 3=DumpGroupMembers
+  my $refListCat = $$refDbh->selectall_arrayref('SELECT DISTINCT(cat) FROM PROFILES');
+  my $nbrLists   = scalar(@$refListCat);
+  my $firstPage; # First page is the main page
+  my $first = 0;
+  my $count = 0;
+  # List of pages
+  my %listPages;
+  foreach my $cat (@$refListCat) { $listPages{$$cat[0]} = "$$refInfos{filename} - $$cat[0]\.html"; }
+  # Turn on progress bar
+  my $count1 = 0;
+  $winPb->lblCount1->Text("0/$nbrLists");
+  $winPb->pbWinPb1->SetRange(0, $nbrLists);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  # Create one page per category
+  foreach my $cat (@$refListCat) {
+    # Turn on progress bar
+    my $nbrItems = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES WHERE cat = ?', undef, $$cat[0]);
+    my $encodedName = encode($$refInfos{charSet}, $$cat[0]);
+    $winPb->lblPbCurr2->Text("$STR{'Creating'} $STR{'page'}: $encodedName");
+    $winPb->pbWinPb2->SetRange(0, $nbrItems);
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->pbWinPb2->SetStep(1);
+    $winPb->lblCount2->Text("0/$nbrItems");
+    my $count2   = 0;
+    my $filename = "$$refInfos{saveDir}\\$listPages{$$cat[0]}";
+    if (!$first) { $firstPage = $filename; $first = 1; } # Keep the filename of the first page
+    open(HTML, ">:encoding(utf8)", $filename);
+    print HTML "<!DOCTYPE html>\n";
+    print HTML "<html>\n<head>\n<title>$$refInfos{filename}</title>\n";
+    print HTML "<meta charset=\"UTF-8\">\n";
+    print HTML "<meta name=\"generator\" content=\"DumpItBlue $VERSION\">\n";
+		print HTML "<style>\n";
+		print HTML "table, th, td {\n";
+		print HTML "  border: 1px solid black;\n";
+		print HTML "  border-collapse: collapse;\n";
+		print HTML "}\n";
+		print HTML "th, td {\n";
+		print HTML "  padding: 5px;\n";
+		print HTML "}\n";
+		print HTML "</style>\n";
+    print HTML "</head>\n";
+    print HTML "<body>\n";
+		print HTML "<h1 style=\"color:#003300;font-size: 18pt;font-variant: small-caps;font-weight: bold;\;text-align: center;\">";
+    print HTML "$$refInfos{filename}\n";
+    print HTML "</h1>\n";
+    print HTML "<table style=\"margin: auto;\">\n";
+    print HTML "<tr><th colspan=4 style=\"height: 50px; color:#003300; background-color:#EEEEEE; font-size: 14pt; font-variant: small-caps; font-weight: bold;\">\n";
+    my $header;
+    foreach my $catListPages (sort keys %listPages) {
+      if ($catListPages eq $$cat[0]) { $header .= "$catListPages - "; }
+      else                           { $header .= "<a href=\"./$listPages{$catListPages}\">$catListPages</a> - "; }
+    }
+    chop($header); chop($header); chop($header);
+    print HTML "$header</th></tr>\n";
+    my $catURL;
+    if    ($$refInfos{"$$cat[0]-url"}) { $catURL = $$refInfos{"$$cat[0]-url"}; }
+    elsif ($$refInfos{startingURL}   ) { $catURL = $$refInfos{startingURL};    }
+    print HTML "<tr><td colspan=4 style=\"text-align: center;\">Origin url:<a href=\"$catURL\">$catURL</a></td></tr>\n" if $catURL;
+    my $col = 0; # 2 columns per friend, first is profile icon, second is details
+    # Select all profile for this category
+    my $sthAll;
+    if ($type == 2) { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY nbr DESC'); }
+    else            { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY ind');      }
+    # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+    $sthAll->execute($$cat[0]);
+    while (my $entry = $sthAll->fetchrow_arrayref()) {
+      print HTML "<tr>" if !$col;
+      if ($$entry[8] and -e $$entry[7]) { print HTML "<td style=\"text-align: center;\"><img src=\"$$entry[8]\" alt=\"\"></td>"; }
+      else                              { print HTML "<td style=\"text-align: center;\"><img src=\"$$entry[6]\" alt=\"\"></td>"; }
+      $col++;
+      print HTML "<td><strong>$STR{'Name'}</strong>: $$entry[3]<br>";
+      print HTML "<strong>$STR{'ProfileID'}</strong>: $$entry[1]</strong>";
+      print HTML "<br><strong>$STR{'url'}</strong>: <a href=\"$$entry[4]\" target=\"_blank\">$$entry[4]</a>";
+      print HTML "<br><strong>$STR{'Details'}</strong>: $$entry[5]" if $$entry[5];
+      print HTML "<br><strong>$STR{'Count'}</strong>: $$entry[9]" if $$entry[9];
+      print HTML "</td>";
+      $col++;
+      if ($col == 4) { print HTML "</tr>\n"; $col = 0; }
+      $count2++;
+      $winPb->pbWinPb2->StepIt();
+      $winPb->lblCount2->Text("$count2/$nbrItems");
+    }
+    print HTML "</body>\n</html>";
+    close(HTML);
+    $count++;
+    $winPb->lblCount1->Text("$count/$nbrLists");
+    $winPb->pbWinPb1->StepIt();
+  }
+  return($firstPage) if $firstPage;  
+  
+}  #--- End createProfilesReportHTML
+
+#--------------------------#
+sub createProfilesReportTXT
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $type) = @_;
+  # Type: 1=DumpFriends, 2=DumpContrib, 3=DumpGroupMembers
+  my $filename      = "$$refInfos{saveDir}\\$$refInfos{filename}\.txt";
+  my $refListCat    = $$refDbh->selectall_arrayref('SELECT DISTINCT(cat) FROM PROFILES');
+  my $detailsExists = $$refDbh->selectrow_array('SELECT COUNT(details) FROM PROFILES WHERE details IS NOT NULL'); # details exists?
+  my $countExists   = $$refDbh->selectrow_array('SELECT COUNT(nbr) FROM PROFILES WHERE nbr IS NOT NULL'); # Count exists? (For contributors)
+  # Turn on progress bar
+  my $count1   = 0;
+  my $nbrLists = scalar(@$refListCat);
+  $winPb->lblCount1->Text("0/$nbrLists");
+  $winPb->pbWinPb1->SetRange(0, $nbrLists);
+  $winPb->pbWinPb1->SetPos(0);
+  $winPb->pbWinPb1->SetStep(1);
+  $winPb->lblPbCurr1->Text("$STR{'Creating'} $STR{'textFile'}");
+  if (open(my $txt, ">:encoding(utf8)", $filename)) {
+    print $txt "$STR{'List'}\t$STR{'originURL'}\t$STR{'ProfileID'}\t";
+    print $txt "$STR{'url'}\t";
+    print $txt "$STR{'Name'}";
+    print $txt "\t$STR{'Details'}" if $detailsExists;
+    print $txt "\t$STR{'Count'}"   if $countExists;
+    print $txt "\n"; # Header
+    foreach my $cat (@$refListCat) {
+      my $catURL;
+      if    ($$refInfos{"$$cat[0]-url"}) { $catURL = $$refInfos{"$$cat[0]-url"}; }
+      elsif ($$refInfos{startingURL}   ) { $catURL = $$refInfos{startingURL};    }
+      else                               { $catURL = '-';                        }
+      # Turn on progress bar
+      my $nbrItems = $$refDbh->selectrow_array('SELECT COUNT(id) FROM PROFILES WHERE cat = ?', undef, $$cat[0]);
+      my $encodedName = encode($$refInfos{charSet}, $$cat[0]);
+      $winPb->lblPbCurr2->Text("$STR{'Creating'} $STR{'page'}: $encodedName");
+      $winPb->pbWinPb2->SetRange(0, $nbrItems);
+      $winPb->pbWinPb2->SetPos(0);
+      $winPb->pbWinPb2->SetStep(1);
+      $winPb->lblCount2->Text("0/$nbrItems");
+      my $count2 = 0;
+      # Select all profile for this category
+      my $sthAll;
+      if ($type == 2) { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY nbr DESC'); }
+      else            { $sthAll = $$refDbh->prepare('SELECT * FROM PROFILES WHERE cat = ? ORDER BY ind');      }
+      # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+      $sthAll->execute($$cat[0]);
+      while (my $entry = $sthAll->fetchrow_arrayref()) {
+        print $txt "$$cat[0]\t$catURL\t$$entry[1]\t";
+        print $txt "$$entry[4]\t";
+        print $txt "$$entry[3]";
+        if ($$entry[5]) {
+          $$entry[5] = decode_entities($$entry[5]);
+          print $txt "\t$$entry[5]";
+        }
+        print $txt "\t$$entry[9]" if $$entry[9];
+        print $txt "\n";
+        $count2++;
+        $winPb->pbWinPb2->StepIt();
+        $winPb->lblCount2->Text("$count2/$nbrItems");
+      }
+      $count1++;
+      $winPb->lblCount1->Text("$count1/$nbrLists");
+      $winPb->pbWinPb1->StepIt();
+    }
+    close($txt);
+    return($filename);
+  }
+  
+}  #--- End createProfilesReportTXT
+
+#--------------------------#
+sub createCommentReportHTML
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $nbrComments) = @_;
+  $winPb->lblPbCurr2->Text("$STR{'Writing'} $STR{'Comments'}...");
+  # Save the Comments in a HTML file
+  my $htmlCommentsPage = "$$refInfos{saveDir}\\$$refInfos{filename}.html";
+	open(HTML, ">:encoding(utf8)", $htmlCommentsPage);
+	print HTML "<!DOCTYPE html>\n";
+	print HTML "<html>\n<head>\n<title>$$refInfos{filename}</title>\n";
+	print HTML "<meta charset=\"utf8\">\n";
+  print HTML "<meta name=\"generator\" content=\"DumpItBlue $VERSION\">\n";
+	print HTML "<style>\n";
+	print HTML "table, th, td {\n";
+  print HTML "  border: 1px solid black;\n";
+  print HTML "  border-collapse: collapse;\n";
+	print HTML "}\n";
+	print HTML "th, td {\n";
+  print HTML "  padding: 5px;\n";
+	print HTML "}\n";
+	print HTML "</style>\n";
+	print HTML "</head>\n";
+	print HTML "<body>\n";
+	print HTML "<h1 style=\"color:#003300;font-size: 18pt;font-variant: small-caps;font-weight: bold;\;text-align: center;\">";
+	print HTML "$$refInfos{filename}</h1>\n";
+	# Turn on progress bar
+  my $count2 = 0;
+	$winPb->pbWinPb2->SetRange(0, $nbrComments);
+	$winPb->pbWinPb2->SetPos(0);
+	$winPb->pbWinPb2->SetStep(1);
+	$winPb->lblCount2->Text("0/$nbrComments");
+  my $refCommentsURL = $$refDbh->selectall_arrayref('SELECT DISTINCT(url) FROM COMMENTS');
+  foreach my $commentsURL (@$refCommentsURL) {
+    print HTML "<h2 style=\"color:#003300;font-size: 16pt;\;text-align: center;\">";
+    print HTML "<a href=\"$$commentsURL[0]\" target=\"_blank\">$$commentsURL[0]<\/a></h2>\n";
+    print HTML "<table width=\"80%\" style=\"margin: auto;\">\n";
+    print HTML "<tr>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'Image'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'Name'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'ProfileID'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'url'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'Date'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'Time'}</td>\n";
+    print HTML "<td style=\"font-weight: bold;text-align: center;\">$STR{'Comments'}</td>\n";
+    print HTML "</tr>\n";
+    my $sthComments = $$refDbh->prepare('SELECT * FROM COMMENTS WHERE url = ? ORDER BY id');
+    # Print all comments for the page
+    $sthComments->execute($$commentsURL[0]);
+    while (my $entry = $sthComments->fetchrow_arrayref()) {
+      # COMMENTS fields for $entry : 0=id, 1=profilId, 2=date, 3=msg, 4=url, 5=depth
+      my @profileDetails = $$refDbh->selectrow_array('SELECT * FROM PROFILES WHERE id = ?', undef, $$entry[1]);
+      # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+      print HTML "<tr>\n";
+      # Profile Image
+      print HTML "<td style=\"text-align: center;vertical-align: center;\">";
+      my $profileImgPath;
+      if (scalar(@profileDetails) and $profileDetails[7] and -e $profileDetails[7] and $profileDetails[8]) {
+        $profileImgPath = $profileDetails[8]; # Profile image is local
+      } elsif (scalar(@profileDetails)) {
+        $profileImgPath = $profileDetails[6]; # Profile image is url
+      }
+      print HTML "<img src=\"$profileImgPath\" alt=\"\" style=\"width:32px;height:32px;\">" if $profileImgPath;
+      print HTML "</td>\n";
+      # Profile name
+      print HTML "<td>";
+      print HTML $profileDetails[3] if scalar(@profileDetails) and $profileDetails[3];
+      print HTML "</td>\n";
+      # Profile ID
+      print HTML "<td>";
+      print HTML $$entry[1] if $$entry[1];
+      print HTML "</td>\n";
+      # Profile URL
+      print HTML "<td>";
+      if (scalar(@profileDetails) and $profileDetails[4]) {
+        print HTML "<a href=\"$profileDetails[4]\" target=\"_blank\">$profileDetails[4]</a>";
+      }
+      print HTML "</td>\n";
+      # Date and time
+      my $dateStr       = &formatDate($$entry[2]);
+      my ($date, $time) = split(/ /, $dateStr);
+      print HTML "<td>$date</td>\n<td>$time</td>\n";
+      # Comment
+      print HTML "<td";
+      if ($$entry[5]) { # Indentation
+        print HTML " style=\"padding-left:" . ($$entry[5]*50) . "px; background-color: #F5F5F5;\"";
+      }
+      print HTML ">";
+      if ($$entry[3]) {
+        my $string = $$entry[3];
+        # Comment contain at least one image
+        if ($string =~ /\<img/) {
+          my $tmpMessage       = $string;
+          my $sthCommentsFiles = $$refDbh->prepare('SELECT * FROM PROFILES WHERE url = ?');
+          # COMMENTS_FILES fields: url, path, relPath
+          while ($tmpMessage =~ /\<img/) {
+            my $tag;
+            my $url;
+            if ($tmpMessage =~ /(\<img.+?[^\>]+\>)/) {
+              $tag = $1;
+              # Replace url if exists in database
+              if ($tag =~ /\<img/ and $tag =~ /src="([^\"]+)"/ ) {
+                my $searchURL = $url = $1;
+                $searchURL    =~ s/&amp;/&/g;
+                my @commentFilesEntry = $$refDbh->selectrow_array('SELECT * FROM COMMENTS_FILES WHERE url = ?', undef, $searchURL);
+                # COMMENTS_FILES fields: url, path, relPath
+                if (scalar(@commentFilesEntry) and $commentFilesEntry[1] and -e $commentFilesEntry[1] and $commentFilesEntry[2]) {
+                  $url    = quotemeta($url);
+                  $string =~ s/$url/$commentFilesEntry[2]/;
+                }
+              }
+              if ($tag) { # Crop $tmpMessage
+                my $offset  = length($tag);
+                $tmpMessage = substr($tmpMessage,$offset,length($tmpMessage)-$offset);
+              } else { last; }
+            }
+          }
+        }
+        print HTML $string;
+      }
+      print HTML "</td>\n";
+      print HTML "</tr>\n";
+      $count2++;
+      $winPb->lblCount2->Text("$count2/$nbrComments");
+      $winPb->pbWinPb2->StepIt();
+    }
+    print HTML "</table>\n";
+  }
+	print HTML "</body>\n</html>\n";
+	close(HTML);
+  return($htmlCommentsPage);
+
+}  #--- End createCommentReportHTML
+
+#--------------------------#
+sub createCommentReportXLSX
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $nbrComments) = @_;
+  my $filename = "$$refInfos{saveDir}\\$$refInfos{filename}\.xlsx";
+  my $excel;
+  my $count = 1;
+  while (!($excel = Excel::Writer::XLSX->new($filename))) { # If file is already open, must be renamed
+    $filename = "$$refInfos{saveDir}\\$$refInfos{filename} [".$count++."]\.xlsx";
+    last if $count == 10; # Stop after 10 attempts
+  }
+  if ($excel) {
+    # Set metadata
+    $excel->set_properties(title => $$refInfos{filename}, comments => 'DumpItBlue '.$VERSION);
+    # Formats
+    my $format      = $excel->add_format(valign => 'vcenter', align  => 'center', bold => 1);
+    my $format2     = $excel->add_format(valign => 'top', text_wrap  => 1);
+    my $formatDate  = $excel->add_format(valign => 'top', num_format => 'yyyy-mm-dd');
+    my $formatTime  = $excel->add_format(valign => 'top', num_format => 'hh:mm:ss'  );
+    # Turn on progress bar
+    my $count2 = 0;
+    $winPb->pbWinPb2->SetRange(0, $nbrComments);
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->pbWinPb2->SetStep(1);
+    $winPb->lblCount2->Text("0/$nbrComments");
+    if (my $sheet = $excel->add_worksheet($STR{'Comments'})) { # A sheet per page
+      my $j = 0; # Column no
+      # Headers
+      if ($$refInfos{incIcons}) { $sheet->write_string(0, $j, $STR{'Image'}, $format); $j++; }
+      $sheet->write_string(0, $j, $STR{'Name'}      , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'ProfileID'} , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'url'}       , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'Date'}      , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'Time'}      , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'Comments'}  , $format); $j++;
+      $sheet->write_string(0, $j, $STR{'originURL'} , $format);
+      # Create content
+      my $i = 1; # Row no
+      my $maxWidthCol1 = length($STR{'Image'}     )+5;
+      my $maxWidthCol2 = length($STR{'Name'}      )+5;
+      my $maxWidthCol3 = length($STR{'ProfileID'} )+5;
+      my $maxWidthCol4 = length($STR{'url'}       )+5;
+      my $maxWidthCol8 = length($STR{'originURL'} )+5;
+      my $sthComments = $$refDbh->prepare('SELECT * FROM COMMENTS ORDER BY id');
+      # Print all comments for the page
+      $sthComments->execute();
+      while (my $entry = $sthComments->fetchrow_arrayref()) {
+        $j = 0;
+        # COMMENTS fields for $entry : 0=id, 1=profilId, 2=date, 3=msg, 4=url, 5=depth
+        my @profileDetails = $$refDbh->selectrow_array('SELECT * FROM PROFILES WHERE id = ?', undef, $$entry[1]);
+        # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+        # Profile Image
+        if ($$refInfos{incIcons}) { 
+          $sheet->write_blank($i, $j);
+          my $profileImgPath;
+          if (scalar(@profileDetails) and $profileDetails[7] and -e $profileDetails[7] and $profileDetails[8]) {
+            $sheet->insert_image($i, $j, $profileDetails[7]);
+            $sheet->set_row($i, 30);
+          }
+          $j++;
+        }
+        # Profile name
+        if (scalar(@profileDetails) and $profileDetails[3]) {
+          $sheet->write_string($i, $j, $profileDetails[3]);
+          $maxWidthCol2 = length($profileDetails[3]) if length($profileDetails[3]) > $maxWidthCol2;
+        }
+        $j++;
+        # Profile ID
+        if ($$entry[1]) {
+          $sheet->write_string($i, $j, $$entry[1]);
+          $maxWidthCol3 = length($$entry[1]) if length($$entry[1]) > $maxWidthCol3;
+        }
+        $j++;
+        # Profile url
+        if (scalar(@profileDetails) and $profileDetails[4]) {
+          $sheet->write_string($i, $j, $profileDetails[4]);
+          $maxWidthCol4 = length($profileDetails[4]) if length($profileDetails[4]) > $maxWidthCol4;
+        }
+        $j++;
+        # Date and time
+        my $dateStr       = &formatDate($$entry[2]);
+        my ($date, $time) = split(/ /, $dateStr);
+        $sheet->write_date_time($i, $j, $date, $formatDate); $j++;
+        $sheet->write_date_time($i, $j, $time, $formatTime); $j++;
+        # Comment
+        if ($$entry[3]) {
+          my $string = decode_entities($$entry[3]);
+          if ($string =~ /(\<[^\>]+\>)/) { # Comment contains a tag
+            my $tag = $1;
+            if ($tag =~ /emoji.php/) { # Remove emoji tag
+              while ($string =~ /(\<img[^\>]+emoji.php[^\>]+alt="([^\"]*)"[^\>]*\>)/) {
+                my $tmpTag   = quotemeta($1);
+                my $emojiAlt = $2;
+                $string      =~ s/$tmpTag/ $emojiAlt/g;
+              }
+            }
+            $string =~ s/<br>/\r\n/g;
+            $string =~ s/<img[^\>]+src="([^\"]+)"[^\>]*>/[$STR{'Image'}: $1]\r\n/g;
+            $string =~ s/<a[^\>]+>([^\<]+)\<\/a\>/$1\r\n/g;
+            $string =~ s/<[^\>]+>//g;
+            $string =~ s/(?:\r\n)+/\r\n/g;
+            $string =~ s/\r\n$//g;
+            $string = unescape($$entry[3]);
+            $string =~ s/&amp;/&/g;
+          }
+          $sheet->write_string($i, $j, $string);
+        }
+        $j++;
+        # Origin url
+        $sheet->write_string($i, $j, $$entry[4]);
+        $maxWidthCol8 = length($$entry[4]) if length($$entry[4]) > $maxWidthCol8;
+        # Progress
+        $i++;
+        $winPb->pbWinPb2->StepIt();
+        $count2++;
+        $winPb->lblCount2->Text("$count2/$nbrComments");
+      }
+      # Set autofilter
+      $sheet->autofilter(0, 0, 0, $j);
+      $sheet->freeze_panes(1, 0);
+      # Ajust column sizes
+      $j = 0;
+      $sheet->set_column($j, 7, undef, $format2);
+      if ($$refInfos{incIcons}) { $sheet->set_column($j, $j, $maxWidthCol1); $j++; }
+      $sheet->set_column($j, $j, $maxWidthCol2); $j++;
+      $sheet->set_column($j, $j, $maxWidthCol3+4); $j++;
+      $sheet->set_column($j, $j, $maxWidthCol4+4); $j++;
+      $sheet->set_column($j, $j,  10); $j++; # Date
+      $sheet->set_column($j, $j,  10); $j++; # Time
+      $sheet->set_column($j, $j, 100); $j++; # Comment
+      $sheet->set_column($j, $j, $maxWidthCol8+4); 
+    }
+    $excel->close();
+    return($filename);
+  }
+  
+}  #--- End createCommentReportXLSX
+
+#--------------------------#
+sub createCommentReportTXT
+#--------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos, $nbrComments) = @_;
+  my $filename = "$$refInfos{saveDir}\\$$refInfos{filename}\.txt";
+  my $count = 1;
+  if (open(my $txt, ">:encoding(utf8)", $filename)) {
+    # Turn on progress bar
+    my $count2 = 0;
+    $winPb->pbWinPb2->SetRange(0, $nbrComments);
+    $winPb->pbWinPb2->SetPos(0);
+    $winPb->pbWinPb2->SetStep(1);
+    $winPb->lblCount2->Text("0/$nbrComments");
+    my $sthComments = $$refDbh->prepare('SELECT * FROM COMMENTS ORDER BY id');
+    # Headers
+    print $txt "$STR{'Name'}\t$STR{'ProfileID'}\t$STR{'url'}\t$STR{'Date'}\t$STR{'Time'}\t$STR{'Comments'}\t$STR{'originURL'}\n";
+    my $i = 1; # Line no
+    # Print all messages
+    $sthComments->execute();
+    while (my $entry = $sthComments->fetchrow_arrayref()) {
+      my $newLine;
+      # COMMENTS fields for $entry : 0=id, 1=profilId, 2=date, 3=msg, 4=url, 5=depth
+      my @profileDetails = $$refDbh->selectrow_array('SELECT * FROM PROFILES WHERE id = ?', undef, $$entry[1]);
+      # PROFILES fields: 0=cat, 1=id, 2=ind, 3=name, 4=url, 5=details, 6=pictureURL, 7=picturePath, 8=pictureRelPath, 9=nbr
+      # Profile name
+      $newLine .= $profileDetails[3] if scalar(@profileDetails) and $profileDetails[3];
+      $newLine .= "\t";
+      # Profile id
+      $newLine .= $$entry[1] if $$entry[1];
+      $newLine .= "\t";
+      # Profile url
+      $newLine .= $profileDetails[4] if scalar(@profileDetails) and $profileDetails[4];
+      $newLine .= "\t";
+      # Date
+      my $dateStr       = &formatDate($$entry[2]);
+      my ($date, $time) = split(/ /, $dateStr);
+      $newLine .= "$date\t$time\t";
+      # Comment
+      if ($$entry[3]) {
+        my $string = decode_entities($$entry[3]);
+        if ($string =~ /(\<[^\>]+\>)/) { # Comment contains a tag
+          my $tag = $1;
+          if ($tag =~ /emoji.php/) { # Remove emoji tag
+            while ($string =~ /(\<img[^\>]+emoji.php[^\>]+alt="([^\"]*)"[^\>]*\>)/) {
+              my $tmpTag   = quotemeta($1);
+              my $emojiAlt = $2;
+              $string      =~ s/$tmpTag/ $emojiAlt/g;
+            }
+          }
+          $string =~ s/<br>/ /g;
+          $string =~ s/<img[^\>]+src="([^\"]+)"[^\>]*>/[$STR{'Image'}: $1] /g;
+          $string =~ s/<a[^\>]+>([^\<]+)\<\/a\>/$1 /g;
+          $string =~ s/<[^\>]+>//g;
+          $string =~ s/(?:  )+/ /g;
+          $string = unescape($string);
+          $string =~ s/&amp;/&/g;
+        }
+        $newLine .= $string;
+      }
+      $newLine .= "\t";
+      # Origin URL
+      $newLine .= $$entry[4];
+      print $txt $newLine . "\n";
+      # Progress
+      $i++;
+      $winPb->pbWinPb2->StepIt();
+      $count2++;
+      $winPb->lblCount2->Text("$count2/$nbrComments");
+    }
+    close($txt);
+    return($filename);
+  }
+  
+}  #--- End createCommentReportTXT
+
+#--------------------------#
+sub scrollPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $time) = @_;
+  my $count = 0;
+  my ($offSet, $type) = $$refMech->eval_in_page('document.body.offsetHeight');
+  while ($count < 3) {
+    $$refMech->eval_in_page('if (document.body) { window.scrollTo(0,document.body.scrollHeight); } ');
+    sleep($time);
+    my ($lastOffSet, $type2) = $$refMech->eval_in_page('document.body.offsetHeight');
+    if ($lastOffSet == $offSet) { $count++; }
+    else { $count = 0; }
+    $offSet = $lastOffSet;
+  }
+  
+}  #--- End scrollPage
+
+#--------------------------#
+sub scrollFriendPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $time) = @_;
+  if (my $seeAllLink = $$refMech->selector('a._3t3', any => 1)) { # Click on See all link
+    $$refMech->follow_link(class => '_3t3') if $seeAllLink->{attributes}->{href} =~ /friends/;
+  }  
+  while (1) {
+    my @parts = $$refMech->selector('div._30f'); # Not end of the page, but all friends are visible
+    return(1) if scalar(@parts) > 2;
+		$$refMech->eval_in_page('if (document.body) { window.scrollTo(0,document.body.scrollHeight) }');
+  }
+
+}  #--- End scrollFriendPage
+
+#--------------------------#
+sub expandContent
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $viewMore = $$refMech->selector('a._4sxc._42ft', any => 1);
+  while ($viewMore) {
+    $$refMech->eval_in_page("var el = document.getElementsByClassName('_4sxc _42ft'); for (var i=0;i<el.length; i++) { el[i].click(); }");
+    sleep(1);
+    $viewMore = $$refMech->selector('a._4sxc._42ft', any => 1);
+  }
+  $viewMore = $$refMech->selector('a.UFIPagerLink', any => 1);
+  while ($viewMore) {
+    $$refMech->eval_in_page("var el = document.getElementsByClassName('UFIPagerLink'); for (var i=0;i<el.length; i++) { el[i].click(); }");
+    sleep(1);
+    $viewMore = $$refMech->selector('a.UFIPagerLink', any => 1);
+  }
+
+}  #--- End expandContent
+
+#--------------------------#
+sub scrollLikePage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $time) = @_;
+	my $end = 0;
+  while (!$end) { # Click on "See more" button and wait for content to load
+    sleep($time);
+    $$refMech->eval_in_page('if (document.body) { window.scrollTo(0,document.body.scrollHeight) }');
+    my $seeMore = $$refMech->selector('a.pam.uiBoxLightblue.uiMorePagerPrimary', any => 1);
+    if ($seeMore) { $$refMech->eval_in_page("var el = document.getElementsByClassName('pam uiBoxLightblue uiMorePagerPrimary'); if (el.length > 0) { el[0].click(); }"); }
+		else {
+			sleep($time); # End of the page, done ? Really ? Wait a bit more
+			$seeMore = $$refMech->selector('a.pam.uiBoxLightblue.uiMorePagerPrimary', any => 1);
+      if ($seeMore) { $$refMech->eval_in_page("var el = document.getElementsByClassName('pam uiBoxLightblue uiMorePagerPrimary'); if (el.length > 0) { el[0].click(); }"); }
+			else          { $end++; }
+		}
+  }
+
+}  #--- End scrollLikePage
+
+#--------------------------#
+sub createPicturesDB
+#--------------------------#
+{
+  # Local variables
+  my $refDbh = shift;
+  # Create Pictures Table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS PICTURES
+                (album         VARCHAR(255)  NOT NULL,
+                 ind           INT           NOT NULL,
+                 pageURL       VARCHAR(255)  NOT NULL,
+                 pubDate       VARCHAR(255),
+                 smallName     VARCHAR(255),
+                 smallURL      VARCHAR(255),
+                 smallPath     VARCHAR(255),
+                 smallRelPath  VARCHAR(255),
+                 largeName     VARCHAR(255),
+                 largeURL      VARCHAR(255),
+                 largePath     VARCHAR(255),
+                 largeRelPath  VARCHAR(255),
+                 videoName     VARCHAR(255),
+                 videoURL      VARCHAR(255),
+                 videoPath     VARCHAR(255),
+                 videoRelPath  VARCHAR(255),
+                 PRIMARY KEY (album,ind)));
+  $$refDbh->do($stmt);
+  $$refDbh->commit();
+  
+}  #--- End createPicturesDB
+
+#--------------------------#
+sub createProfilesDB
+#--------------------------#
+{
+  # Local variables
+  my $refDbh = shift;
+  # Create Profiles Table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS PROFILES
+                (cat            VARCHAR(255) NOT NULL,
+                 id             INT          NOT NULL,
+                 ind            INT          NOT NULL,
+                 name           VARCHAR(255) NOT NULL,
+                 url            VARCHAR(255),
+                 details        VARCHAR(255),
+                 pictureURL     VARCHAR(255),
+                 picturePath    VARCHAR(255),
+                 pictureRelPath VARCHAR(255),
+                 nbr            INT,
+                 PRIMARY KEY (cat,id)));
+  $$refDbh->do($stmt);
+  $$refDbh->commit();
+  
+}  #--- End createProfilesDB
+
+#--------------------------#
+sub createCommentsDB
+#--------------------------#
+{
+  # Local variables
+  my $refDbh = shift;
+  # Create Profiles Table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS COMMENTS
+                (id             INT          NOT NULL,
+                 profilId       INT          NOT NULL,
+                 date           INT          NOT NULL,
+                 msg            VARCHAR(255),
+                 url            VARCHAR(255),
+                 depth          INT,
+                 PRIMARY KEY (id)));
+  $$refDbh->do($stmt);
+  $stmt    = qq(CREATE TABLE IF NOT EXISTS COMMENTS_FILES
+                (url        VARCHAR(255) NOT NULL,
+                 path       VARCHAR(255),
+                 relPath    VARCHAR(255),
+                 PRIMARY KEY (url)));
+  $$refDbh->do($stmt);
+  $$refDbh->commit();
+  
+}  #--- End createCommentsDB
+
+#--------------------------#
+sub createlikesPagesDB
+#--------------------------#
+{
+  # Local variables
+  my $refDbh = shift;
+  # Create Profiles Table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS LIKES_PAGES
+                (url    VARCHAR(255) NOT NULL,
+                 status INT,
+                 PRIMARY KEY (url)));
+  $$refDbh->do($stmt);
+  $$refDbh->commit();
+  
+}  #--- End createlikesPagesDB
+
+#------------------------------------------------------------------------------#
+sub updateDumpDB_INFOS
+#------------------------------------------------------------------------------#
+{
+  # Local variables
+  my ($refDbh, $refInfos) = @_;
+  my $sthUptInfos = $$refDbh->prepare('INSERT OR REPLACE INTO INFOS (key, value) VALUES(?,?)');
+  foreach my $key (keys %{$refInfos}) { $sthUptInfos->execute($key, $$refInfos{$key}); }
+  $$refDbh->commit();
+  
+}  #--- End updateDumpDB_INFOS
+
+#--------------------------#
+sub debug
+#--------------------------#
+{
+  # Local variables
+  my ($refMsg) = @_;
+  my $dateStr  = &formatDate(time);
+  $refMsg      = decode_entities($refMsg);
+  # Save error msg in debug log file
+	my $fhLog;
+  if (-e $DEBUG_FILE) { open($fhLog,">>$DEBUG_FILE"); }
+  else                { open($fhLog,">$DEBUG_FILE");  }
+  flock($fhLog, 2);
+  print $fhLog "$dateStr\t[DumpItBlue-Process.exe]\t$refMsg\n";
+  close($fhLog);  
+
+}  #--- End debug
+
+#--------------------------#
+sub formatDate
+#--------------------------#
+{
+  # Local variables
+  my $unixtime = shift;
+  # Convert to string, local timezone
+  if ($unixtime =~ /\./) { $unixtime = (split(/\./, $unixtime))[0]; }
+  my ($s,$min,$hr,$d,$m,$y,$weekday,$ha,$isDST) = localtime($unixtime);
+	return(sprintf("%04d\-%02d\-%02d %02d:%02d:%02d", $y+1900, $m+1, $d, $hr, $min, $s));
+
+}  #--- End formatDate
+
+#--------------------------#
+sub btnCancel_Click { exit(0); }
+#--------------------------#

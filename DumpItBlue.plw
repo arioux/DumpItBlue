@@ -1,0 +1,1474 @@
+#!/usr/bin/perl
+# Perl - v: 5.16.3
+#------------------------------------------------------------------------------#
+# Tool name			: DumpItBlue
+# Description		: Dump Facebook stuff for analysis or reporting purposes
+# WebSite				: http://le-tools.com/DumpItBlue.html
+# Documentation	: http://le-tools.com/DumpItBlueDoc.html
+# SourceForge		: https://sourceforge.net/p/dumpitblue
+# GitHub				: https://github.com/arioux/DumpItBlue
+# Creation			: 2015-08-01
+# Modified			: 2019-05-26
+my $VERSION			= "7.0.2";
+# Author				: Alain Rioux (admin@le-tools.com)
+#
+# Copyright (C) 2015-2019  Alain Rioux (le-tools.com)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#------------------------------------------------------------------------------#
+# Modules
+#------------------------------------------------------------------------------#
+use strict;
+use warnings;
+use Fcntl qw(:flock);
+use threads;
+use threads::shared;
+use utf8;
+use arybase;
+use DBI;
+use LWP::UserAgent;
+use Time::HiRes qw(usleep);
+use Win32::API();
+use Win32::GUI;
+use Win32::GUI qw( WS_POPUP WS_CAPTION WS_THICKFRAME WS_EX_TOPMOST );
+use Win32::GUI::BitmapInline();
+use Win32::GUI::Grid;
+use Win32::Process;
+require "DumpItBlueGraph.pl";
+require "DumpItBlueLang.pl";
+
+#------------------------------------------------------------------------------#
+# Graphic elements
+#------------------------------------------------------------------------------#
+my ($winICO, $logoBmp, $configBmp) = &loadGraph();
+  
+#------------------------------------------------------------------------------#
+# Global variables
+#------------------------------------------------------------------------------#
+my $PROGDIR = $0;                                                              # Program path
+while (chop($PROGDIR) ne "\\") { }                                             # Dir only
+my $USERDIR;                                                                   # User path
+if 	  (-d "$ENV{'APPDATA'}\\DumpItBlue") { $USERDIR = "$ENV{'APPDATA'}\\DumpItBlue"; } # User dir is AppData (default installation)
+elsif (-w "$PROGDIR\\DumpItBlue.ini"		)	{ $USERDIR = $PROGDIR;                       } # Program directory (as standalone, if writable)
+else { # No user directory, we must create one (AppData by default)
+	$USERDIR = "$ENV{'APPDATA'}\\DumpItBlue" if mkdir("$ENV{'APPDATA'}\\DumpItBlue");
+}
+my $URL_DOC      = "http://le-tools.com/DumpItBlueDoc.html";                   # Online documentation
+my $URL_VER      = 'http://www.le-tools.com/download/DumpItBlueVer.txt';       # Url of the version file
+my $URL_TOOL     = 'http://le-tools.com/DumpItBlue.html#Download';             # Url of the tool (download)
+my $CONFIG_FILE  = "$USERDIR\\DumpItBlue.ini";                                 # Configuration file
+my $LANG_FILE    = "$USERDIR\\Lang.ini";                                       # Langage file
+my $DEBUG_FILE   = "$USERDIR\\debug.log";                                			 # Log for error
+my %CONFIG;                                                                    # Configuration
+my %STR;                                                                       # Strings for GUI
+my $THR;                                                                       # Thread
+
+#------------------------------------------------------------------------------#
+# Strings
+#------------------------------------------------------------------------------#
+&loadDefaultStr(\%STR); 																											 # Load default language (en)
+&loadStr(\%STR, $LANG_FILE) if -e $LANG_FILE and -T $LANG_FILE; 							 # If language file, load translated strings
+
+#------------------------------------------------------------------------------#
+# Splash window
+#------------------------------------------------------------------------------#
+my $splash = new Win32::GUI::Window ( -name       => 'Splash'                  ,
+                                      -text       => 'Splash'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [100,100]                 ,
+                                      -addstyle   => WS_POPUP                  ,
+                                      -popstyle   => WS_CAPTION | WS_THICKFRAME,
+                                      -addexstyle => WS_EX_TOPMOST             , );
+$splash->AddLabel(                    -name       => 'Bitmap'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [  0,  0]                 ,
+                                      -bitmap     => $logoBmp                  , );
+
+#------------------------------------------------------------------------------#
+# Main window
+#------------------------------------------------------------------------------#
+my $screen    = Win32::GUI::GetDesktopWindow(); # Screen resolution
+my $scrnX     = Win32::GUI::Width($screen);     # Width
+my $scrnY     = Win32::GUI::Height($screen);    # Height
+my $winWidth  = 520;
+my $winHeight = 195;
+my $winPosX   = ($scrnX - $winWidth)  / 2;
+my $winPosY   = ($scrnY - $winHeight) / 2;
+my $win = Win32::GUI::Window->new(-name       => 'main'               ,
+																	-title      => 'DumpItBlue'         ,
+																	-background => [255, 255, 255]      ,
+																	-width      => $winWidth            ,
+																	-height     => $winHeight           ,
+																	-pos        => [$winPosX, $winPosY] ,
+																	-resizable  => 0                    ,
+																	-hasmaximize=> 0                    , );
+$win->SetIcon($winICO);
+# Fonts
+sub LOGPIXELSX() {88}
+sub getDPI { return(Win32::GUI::DC->new()->GetDeviceCaps(LOGPIXELSX)); }
+my $DPI = &getDPI();
+my $fontGB2;
+my $font10;
+# Larger size (125% and 150%)
+if ($DPI >= 120) {
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 10, -bold => 1, -underline => 1);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size =>  8);
+# Normal size
+} else {
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 12, -bold => 1, -underline => 1);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size => 10);
+}
+# Taskbar
+$win->AddNotifyIcon(-name    => "Tray"           , 
+                    -icon    => $winICO          ,
+                    -tip     => 'DumpItBlue'     ,
+                    -balloon => 1                , );
+# Main section
+$win->AddLabel(   -name        => 'lblLogo'           ,
+                  -size        => [128,128]           ,
+                  -pos         => [  0,  5]           ,
+                  -bitmap      => $logoBmp            ,
+                  -background  => [255, 255, 255]     , );
+$win->AddLabel(   -name        => 'lblText1'          ,
+                  -size        => [ 90, 65]           ,
+                  -pos         => [135, 10]           ,
+                  -font        => $font10             ,
+                  -foreground  => [0  , 0  , 102]     ,
+                  -background  => [255, 255, 255]     ,
+                  -text        => $STR{'update4'}.":\n".$STR{'website'}.":\n".$STR{'author'}.":\n".$STR{'translatedBy'}.':', );
+$win->AddLabel(   -name        => 'lblText2'          ,
+                  -size        => [270, 65]           ,
+                  -pos         => [230, 10]           ,
+                  -font        => $font10             ,
+                  -foreground  => [185, 154,   0]     ,
+                  -background  => [255, 255, 255]     ,
+                  -text        =>  "$VERSION\nhttp://www.le-tools.com/\nAlain Rioux (admin\@le-tools.com)\n$STR{'translatorName'}", );
+$win->AddLabel(   -name        => 'lblText3'          ,
+                  -size        => [300, 20]           ,
+                  -pos         => [135, 80]           ,
+                  -font        => $font10             ,
+                  -foreground  => [0  , 0  , 102]     ,
+                  -background  => [255, 255, 255]     ,
+                  -text        => '© Copyright 2015-2019 Alain Rioux', );
+$win->AddLabel(   -name        => 'lblText4'          ,
+                  -size        => [340, 22]           ,
+                  -pos         => [180,110]           ,
+                  -font        => $font10             ,
+                  -foreground  => [255,   0,   0]     ,
+                  -background  => [255, 255, 255]     ,
+                  -text        => '>> '.$STR{'lblText4'}.' <<', );
+$win->AddCheckbox(-name        => 'chStartMinimized'  ,
+                  -size        => [300, 22]           ,
+                  -pos         => [ 10,140]           ,
+                  -text        => $STR{'chStartMinimized'},
+                  -background  => [255, 255, 255]     ,
+                  -font        => $font10             , );
+# Load taskbar menu
+my $trayMenu = Win32::GUI::Menu->new(
+ 	"SysTray"																	=> "SysTray",
+  ">$STR{'Dump'} $STR{'Albums'}..."					=> { -onClick => sub { &loadDump('Albums'); } },
+  ">$STR{'Dump'} $STR{'Friends'}..."				=> { -onClick => sub { &loadDump('Friends'); } },
+  ">$STR{'Dump'} $STR{'MutualFriends'}..."  => { -onClick => sub { &loadDump('MutualFriends'); } },
+  ">$STR{'Dump'} $STR{'contributors'}..."		=> { -onClick => sub { &loadDump('Contrib'); } },
+  ">$STR{'Dump'} $STR{'Comments'}..."				=> { -onClick => sub { &loadDump('Comments'); } },
+	">$STR{'Dump'} $STR{'groupMembers'}..."		=> { -onClick => sub { &loadDump('GroupMembers'); } },
+	" > -" => 0,
+	">$STR{'ShowQueue'}..."										=> { -name => 'MenuShowQueue'	},
+  " > -" => 0,
+  ">$STR{'Settings'}..."										=> { -name => 'MenuConfig'	},
+  " > -" => 0,
+  ">$STR{'Help'}..."												=> { -name => 'MenuHelp'	},
+  ">$STR{'about'}..."												=> { -name => 'MenuAbout'	},
+  ">$STR{'Quit'}"														=> { -name => 'MenuQuit'	},
+);
+
+#------------------------------------------------------------------------------#
+# Queue window
+#------------------------------------------------------------------------------#
+my $winQueue = Win32::GUI::Window->new( -name        => 'winQueue'    			,
+																				-background  => [255, 255, 255]     ,
+																				-text        => $STR{'Queue'} 			,
+																				-pos         => [$winPosX, $winPosY],
+																				-size        => [800, 300]          ,
+																				-minsize		 => [800, 300]          ,
+																				-hasmaximize => 1                   ,
+																				-hasminimize => 1                   ,
+																				-resizable   => 1                   ,
+																				-dialogui    => 1                   , );
+$winQueue->SetIcon($winICO);
+$winQueue->AddGrid( 	-name         => 'gridQueue'  		,
+											-pos          => [  5,  5]      	,
+											-size         => [780,260]      	,
+											-background   => [255, 255, 255]	,
+											-columns      => 4              	,
+											-fixedrows    => 1              	,
+											-fixedcolumns => 1              	,
+											-editable     => 0              	, );
+$winQueue->gridQueue->SetListMode();
+$winQueue->gridQueue->SetHeaderSort();
+$winQueue->AddButton(	-name       	=> 'btnQueueRefresh',
+											-size       	=> [100, 30]				,
+											-pos        	=> [245,270]				,
+											-text       	=> $STR{'Refresh'}  ,
+											-font       	=> $font10					,
+											-tabstop			=> 1								, );
+$winQueue->AddButton(	-name       	=> 'btnQueueProcess',
+											-size       	=> [200, 30]				,
+											-pos        	=> [355,270]				,
+											-text       	=> $STR{'ProcessQueue'},
+											-font       	=> $font10					,
+											-disabled   	=> 1								,
+											-ok         	=> 1								,
+											-default    	=> 1								,
+											-tabstop			=> 1								, );
+# Popup menu for Queue grid
+my $gridQueueMenu = new Win32::GUI::Menu(
+	'gridQueueMenu'				=> 'gridQueueMenu',
+	"> $STR{'MoveUp'}"		=> 'moveUp'				,
+	"> $STR{'MoveDown'}"	=> 'moveDown'			,
+	" > -" => 0,
+	"> $STR{'Delete'}"		=> 'queueDelete'	,
+);
+# Queue grid header
+$winQueue->gridQueue->SetCellText( 0, 0, ""         );
+$winQueue->gridQueue->SetCellType( 0, 0, GVIT_CHECK );
+$winQueue->gridQueue->SetCellCheck(0, 0, 1);
+$winQueue->gridQueue->SetCellText( 0, 1, $STR{'Process'});
+$winQueue->gridQueue->SetCellText( 0, 2, $STR{'Name'}	 );
+$winQueue->gridQueue->SetCellText( 0, 3, $STR{'url'}	 );
+$winQueue->gridQueue->SetCellFormat(0, 1, 1);
+$winQueue->gridQueue->SetCellFormat(0, 2, 1);
+$winQueue->gridQueue->SetCellFormat(0, 3, 1);
+$winQueue->gridQueue->AutoSize();
+$winQueue->gridQueue->ExpandLastColumn();
+
+#------------------------------------------------------------------------------#
+# Config window
+#------------------------------------------------------------------------------#
+my $winConfig = Win32::GUI::DialogBox->new( -name        => 'winConfig'           ,
+                                            -parent      => $win                  ,
+                                            -text        => $STR{'Settings'}			,
+                                            -pos         => [$winPosX, $winPosY]	,
+                                            -size        => [660,285]             ,
+                                            -background  => [255, 255, 255]       ,
+                                            -hasmaximize => 0                     ,
+                                            -hasminimize => 0                     ,
+                                            -helpbutton  => 0                     ,
+                                            -resizable   => 0                     ,
+                                            -topmost     => 1                     ,
+                                            -dialogui    => 1                     , );
+$winConfig->SetIcon($winICO);
+$winConfig->AddLabel(     -name         => 'lblLogo'             ,
+                          -size         => [128,128]             ,
+                          -pos          => [  0,  5]             ,
+                          -bitmap       => $configBmp            ,
+                          -background   => [255, 255, 255]       , );
+# Tabstrip
+$winConfig->AddTabStrip(  -name         => 'configTab'           ,
+													-size         => [516,258]             ,
+													-pos          => [140,  0]             ,
+													-font					=> $font10               ,
+													-background   => [255, 255, 255]       ,
+													-tabstop      => 1                     , );
+$winConfig->configTab->InsertItem(-text => $STR{'lblGenOpt'});
+$winConfig->configTab->InsertItem(-text => "$STR{'Dump'} - $STR{'Options'}");
+# General options
+# Tool Section
+$winConfig->AddLabel(			-name        => 'lblToolShadowT'			,
+													-size        => [100, 25]             ,
+													-pos         => [151, 31]             ,
+													-foreground  => [180, 180, 180]       ,
+													-background  => [255, 255, 255]       ,
+													-text        => $STR{'Tool'}.':'			,
+													-font        => $fontGB2              , );
+$winConfig->AddLabel(			-name        => 'lblToolT'						,
+													-size        => [100, 25]             ,
+													-pos         => [150, 30]             ,
+													-addstyle    => 11                    , # Transparent
+													-foreground  => [  0, 102, 204]       ,
+													-text        => $STR{'Tool'}.':'			,
+													-font        => $fontGB2              , );
+$winConfig->AddButton(    -name        => 'btnExportLang'       ,
+                          -size        => [150, 24]             ,
+                          -pos         => [150, 58]             ,
+                          -text        => $STR{'btnExportLang'} ,
+                          -font        => $font10               ,
+                          -tabstop     => 1                     , );
+$winConfig->AddButton(    -name        => 'btnOpenUserDir'        ,
+                          -size        => [125, 24]               ,
+                          -pos         => [305, 58]               ,
+                          -text        => $STR{'OpenUserDir'}.'...',
+                          -font        => $font10                 , );
+$winConfig->AddButton(    -name        => 'btnCheckUpdate'      ,
+                          -size        => [150, 24]             ,
+                          -pos         => [150, 88]             ,
+                          -text        => $STR{'update2'}				,
+                          -font        => $font10               ,
+                          -tabstop     => 1                     , );
+$winConfig->AddCheckbox(  -name        => 'chAutoUpdate'        ,
+                          -size        => [250, 20]             ,
+                          -pos         => [305, 90]             ,
+                          -text        => $STR{'chAutoUpdate'}  ,
+                          -background  => [255, 255, 255]       ,
+                          -font        => $font10               ,
+                          -tabstop     => 1                     ,
+                          -checked     => 1                     , );
+# Functions section
+$winConfig->AddLabel(			-name        => 'lblFuncShadowT'			,
+													-size        => [100, 25]             ,
+													-pos         => [151,121]             ,
+													-foreground  => [180, 180, 180]       ,
+													-background  => [255, 255, 255]       ,
+													-text        => $STR{'Functions'}.':'	,
+													-font        => $fontGB2              , );
+$winConfig->AddLabel(			-name        => 'lblFuncT'						,
+													-size        => [100, 25]             ,
+													-pos         => [150,120]             ,
+													-addstyle    => 11                    , # Transparent
+													-foreground  => [  0, 102, 204]       ,
+													-text        => $STR{'Functions'}.':'	,
+													-font        => $fontGB2              , );
+$winConfig->AddCheckbox(  -name        => 'chRememberPos'       ,
+                          -size        => [235, 20]             ,
+                          -pos         => [305,120]             ,
+                          -text        => $STR{'chRememberPos'} ,
+                          -background  => [255, 255, 255]       ,
+                          -font        => $font10               ,
+                          -tabstop     => 1                     , );
+$winConfig->AddLabel(     -name        => 'lblTimeToWait'       ,
+                          -size        => [130, 22]             ,
+                          -pos         => [150,148]             ,
+                          -text        => $STR{'lblTimeToWait'}.':',
+                          -font        => $font10               ,
+                          -background  => [255, 255, 255]       , );
+$winConfig->AddTextfield( -name        => 'tfTimeToWait'        ,
+                          -size        => [ 40, 22]             ,
+                          -pos         => [285,145]             ,
+                          -tip         => $STR{'tfTimeToWaitTip'},
+                          -tabstop     => 1                     , );
+$winConfig->AddUpDown(    -name        => 'upTimeToWait'        ,
+                          -tabstop     => 1                     , );
+$winConfig->upTimeToWait->SetRange(1,10);
+$winConfig->AddLabel(     -name        => 'lblTimeToWait2'      ,
+                          -size        => [ 70, 22]             ,
+                          -pos         => [330,148]             ,
+                          -text        => $STR{'seconds'}				,
+                          -font        => $font10               ,
+                          -background  => [255, 255, 255]       , );
+$winConfig->AddLabel(     -name        => 'lblCharset'          ,
+                          -size        => [100, 22]             ,
+                          -pos         => [150,177]             ,
+                          -text        => $STR{'Charset'}.':'		,
+                          -font        => $font10               ,
+                          -background  => [255, 255, 255]       , );
+$winConfig->AddCombobox(  -name        => 'cbCharset'           ,
+                          -size        => [130,100]             ,
+                          -pos         => [285,174]             ,
+                          -font        => $font10               ,
+                          -dropdown    => 1                     ,
+                          -vscroll     => 1                     ,
+                          -tabstop     => 1                     , );
+$winConfig->cbCharset->Add('cp1252'     , 'iso-8859-1' , 'iso-8859-2' , 'iso-8859-3' ,
+                           'iso-8859-4' , 'iso-8859-5' , 'iso-8859-6' , 'iso-8859-7' ,
+                           'iso-8859-8' , 'iso-8859-9' , 'iso-8859-10', 'iso-8859-11', 
+                           'iso-8859-13', 'iso-8859-14', 'iso-8859-15', 'iso-8859-16', );
+$winConfig->AddLabel(			-name        => 'lblLoggingShadowT'		,
+													-size        => [200, 25]             ,
+													-pos         => [151,201]             ,
+													-foreground  => [180, 180, 180]       ,
+													-background  => [255, 255, 255]       ,
+													-text        => "$STR{'Logging'}:"		,
+													-font        => $fontGB2              ,
+                          -visible     => 0                     , );
+$winConfig->AddLabel(			-name        => 'lblLoggingT'					,
+													-size        => [200, 25]             ,
+													-pos         => [150,200]             ,
+													-addstyle    => 11                    , # Transparent
+													-foreground  => [  0, 102, 204]       ,
+													-text        => "$STR{'Logging'}:"		,
+													-font        => $fontGB2              ,
+                          -visible     => 0                     , );
+$winConfig->AddCheckbox(  -name        => 'chDebugLogging'      ,
+													-size        => [135, 20]             ,
+													-pos         => [150,227]             ,
+													-text        => $STR{'Enable'}				,
+													-background  => [255, 255, 255]       ,
+													-font        => $font10               ,
+													-tabstop     => 1                     ,
+													-visible     => 0                     , );
+$winConfig->AddButton(    -name				 => 'btnOpenLog'          ,
+													-size        => [130, 24]             ,
+													-pos         => [290,226]             ,
+													-text        => $STR{'OpenLog'}.'...' ,
+													-font        => $font10               ,
+													-tabstop     => 1                     ,
+													-visible     => 0                     , );
+$winConfig->AddButton(    -name        => 'btnClearLog'         ,
+													-size        => [130, 24]             ,
+													-pos         => [425,226]             ,
+													-text        => $STR{'ClearLog'}      ,
+													-font        => $font10               ,
+													-tabstop     => 1                     ,
+													-visible     => 0                     , );
+# Dump options - When loading
+$winConfig->AddLabel(				-name        => 'lblLoadingShadowT'		,
+														-size        => [300, 25]             ,
+														-pos         => [151, 31]             ,
+														-foreground  => [180, 180, 180]       ,
+														-background  => [255, 255, 255]       ,
+														-text        => "$STR{'WhenLoading'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddLabel(				-name        => 'lblLoadingT'					,
+														-size        => [300, 25]             ,
+														-pos         => [150, 30]             ,
+														-addstyle    => 11                    , # Transparent
+														-foreground  => [  0, 102, 204]       ,
+														-text        => "$STR{'WhenLoading'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddCheckbox(    -name        => 'chOptAutoLoadScroll' ,
+                            -size        => [250, 20]             ,
+                            -pos         => [150, 55]             ,
+                            -text        => $STR{'AutoLoadScroll'},
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -checked     => 1                     ,
+                            -tabstop     => 1                     ,
+														-visible     => 0                     , );
+$winConfig->AddCheckbox(    -name        => 'chOptScrollTop'      ,
+                            -size        => [230, 20]             ,
+                            -pos         => [405, 55]             ,
+                            -text        => $STR{'chOptScrollTop'},
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -tabstop     => 1                     ,
+                            -checked     => 1                     , );
+$winConfig->AddCheckbox(    -name        => 'chRememberSaveDir'		,
+                            -size        => [250, 20]             ,
+                            -pos         => [150, 80]             ,
+                            -text        => $STR{'RememberSaveDir'},
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -checked     => 1                     ,
+                            -tabstop     => 1                     ,
+														-visible     => 0                     , );
+# Dump options - When processing
+$winConfig->AddLabel(				-name        => 'lblProcessingShadowT',
+														-size        => [300, 25]             ,
+														-pos         => [151,111]             ,
+														-foreground  => [180, 180, 180]       ,
+														-background  => [255, 255, 255]       ,
+														-text        => "$STR{'WhenProcessing'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddLabel(				-name        => 'lblProcessingT'			,
+														-size        => [300, 25]             ,
+														-pos         => [150,110]             ,
+														-addstyle    => 11                    , # Transparent
+														-foreground  => [  0, 102, 204]       ,
+														-text        => "$STR{'WhenProcessing'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddCheckbox(    -name        => 'chSilentProgress'		,
+                            -size        => [350, 20]             ,
+                            -pos         => [150,135]             ,
+                            -text        => $STR{'SilentProgress'},
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -checked     => 1                     ,
+                            -tabstop     => 1                     ,
+														-visible     => 0                     , );
+# Dump options - When finished
+$winConfig->AddLabel(				-name        => 'lblFinishingShadowT'	,
+														-size        => [300, 25]             ,
+														-pos         => [151,166]             ,
+														-foreground  => [180, 180, 180]       ,
+														-background  => [255, 255, 255]       ,
+														-text        => "$STR{'WhenFinished'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddLabel(				-name        => 'lblFinishingT'				,
+														-size        => [300, 25]             ,
+														-pos         => [150,165]             ,
+														-addstyle    => 11                    , # Transparent
+														-foreground  => [  0, 102, 204]       ,
+														-text        => "$STR{'WhenFinished'}:",
+														-font        => $fontGB2              ,
+                            -visible     => 0                     , );
+$winConfig->AddCheckbox(    -name        => 'chOptOpenReport' 		,
+                            -size        => [150, 20]             ,
+                            -pos         => [150,190]             ,
+                            -text        => $STR{'OpenReport'}		,
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -checked     => 1                     ,
+                            -tabstop     => 1                     ,
+														-visible     => 0                     , );
+$winConfig->AddCheckbox(    -name        => 'chOptDontOpenReport'	,
+                            -size        => [220, 20]             ,
+                            -pos         => [355,190]             ,
+                            -text        => $STR{'DontOpenReport'},
+                            -background  => [255, 255, 255]       ,
+                            -font        => $font10               ,
+                            -checked     => 1                     ,
+                            -tabstop     => 1                     ,
+														-visible     => 0                     , );
+$winConfig->AddCheckbox(  	-name        => 'chDelTempFiles'      ,
+														-size        => [220, 20]             ,
+														-pos         => [150,215]             ,
+														-text        => $STR{'chDelTempFiles'},
+														-background  => [255, 255, 255]       ,
+														-font        => $font10               ,
+														-checked     => 1                     ,
+														-tabstop     => 1                     , );
+
+#------------------------------------------------------------------------------#
+# Starting program
+#------------------------------------------------------------------------------#
+open our $PROG_INSTANCE, '<', $0 or die $!;
+flock $PROG_INSTANCE, LOCK_EX|LOCK_NB or die "Program already running...";
+# Center the splash and show it
+$splash->Center();
+$splash->Show();
+Win32::GUI::DoEvents();
+# Taskbar
+$win->Tray->Change(-balloon_icon => 'info', -balloon_title => 'DumpItBlue', -balloon_timeout => 5000);
+&loadConfig;
+threads->create(\&checkUpdate, 0, $VERSION, \$win, \%STR) if $CONFIG{'AUTO_UPDATE'}; # Auto-Update
+my $API = new Win32::API('user32','GetForegroundWindow','', 'N');
+Win32::GUI::DoEvents();
+usleep(500000);
+# Hide Splash 
+$splash->Hide;
+# Verify if there are pending jobs
+&checkQueue;
+# Position the window
+if ($winConfig->chRememberPos->Checked() and exists($CONFIG{'MAIN_LEFT'}) and exists($CONFIG{'MAIN_TOP'})) {
+  $win->Left($CONFIG{'MAIN_LEFT'});
+  $win->Top($CONFIG{'MAIN_TOP'});
+}
+$win->Show() if !$CONFIG{'START_MINIMIZED'};
+Win32::GUI::Dialog();
+
+#--------------------------#
+sub chStartMinimized_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($win->chStartMinimized->Checked()) {
+    $CONFIG{'START_MINIMIZED'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'START_MINIMIZED'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chStartMinimized_Click
+
+#--------------------------#
+sub main_Terminate
+#--------------------------#
+{
+  $win->Disable();  # Act as minimize, to quit, user must use the taskbar function
+  $win->Hide();
+  $win->Tray->ShowBalloon() if $THR and $THR->is_running();
+  return(0);
+
+}  #--- End main_Terminate
+
+#--------------------------#
+sub main_Minimize
+#--------------------------#
+{
+  $win->Disable();
+  $win->Hide();
+  $win->Tray->ShowBalloon() if $THR and $THR->is_running();
+  return(0);
+
+}  #--- End main_Minimize
+
+#--------------------------#
+sub Tray_DblClick
+#--------------------------#
+{
+  $win->Enable();
+  $win->Show();  
+
+}  #--- End Tray_DblClick
+
+#--------------------------#
+sub Tray_RightClick
+#--------------------------#
+{
+  $win->TrackPopupMenu($trayMenu->{SysTray});
+  return(1);
+
+}  #--- End Tray_Click
+
+#--------------------------#
+sub loadDump
+#--------------------------#
+{
+	# Local variables
+	my $type = shift;
+	if (exists($CONFIG{'TIME_TO_WAIT'})) { # DumpItBlue is started
+		my $command = 'DumpItBlue-Load ' . "$type \"$PROGDIR\" \"$USERDIR\"";
+		Win32::Process::Create(my $processObj, $PROGDIR .'\DumpItBlue-Load.exe', $command, 0, NORMAL_PRIORITY_CLASS, $PROGDIR);
+		$win->Tray->Change(-tip => "$STR{'waitProcess'} $STR{'interface'}...");
+		$win->Tray->Change(-balloon_icon => 'info', -balloon_title => 'DumpItBlue',
+											 -balloon_tip  => "$STR{'waitProcess'} $STR{'interface'}...");
+		$win->Tray->ShowBalloon(1);
+		$processObj->Wait(INFINITE);
+		my $exitCode;
+		$processObj->GetExitCode($exitCode);
+		# Verify if new element in queue
+		if (!$exitCode and -d "$USERDIR\\Queue\\" and opendir(DIR, "$USERDIR\\Queue\\")) {
+			while (my $file = readdir(DIR)) {
+				if ($file =~ /\.db$/) {
+					my $dbFile = "$USERDIR\\Queue\\$file";
+					my $dsn    = "DBI:SQLite:dbname=$dbFile";
+					if (-f $dbFile and my $dbh = DBI->connect($dsn, undef, undef, { sqlite_unicode => 1 })) {
+						my $now     = $dbh->selectrow_array('SELECT value FROM INFOS WHERE key = ?', undef, 'now');
+						my $command = $dbh->selectrow_array('SELECT value FROM INFOS WHERE key = ?', undef, 'command');
+						$dbh->disconnect();
+						undef $dbh;
+						if ($now) {
+							Win32::Process::Create(my $processObj, $PROGDIR .'\DumpItBlue-process.exe', $command, 0, NORMAL_PRIORITY_CLASS, $PROGDIR);
+							$win->Tray->Change(-tip => "$STR{'waitProcess'} $STR{'dumpProcess'}...");
+							$win->Tray->Change(-balloon_icon => 'info', -balloon_title => 'DumpItBlue',
+																 -balloon_tip  => "$STR{'waitProcess'} $STR{'dumpProcess'}...");
+							$win->Tray->ShowBalloon(1);
+							$processObj->Wait(INFINITE);
+							$exitCode = 0;
+							$processObj->GetExitCode($exitCode);
+							if (!$exitCode) {
+								unlink($dbFile);
+								# Final message
+								my $typeDump;
+								if    ($command =~ /DumpAlbums/       ) { $typeDump = $STR{'Albums'};        }
+								elsif ($command =~ /DumpFriends/      ) { $typeDump = $STR{'Friends'};       }
+								elsif ($command =~ /DumpMutualFriends/) { $typeDump = $STR{'MutualFriends'}; }
+								elsif ($command =~ /DumpContrib/      ) { $typeDump = $STR{'contributors'};  }
+								elsif ($command =~ /DumpComments/     ) { $typeDump = $STR{'Comments'};      }
+								elsif ($command =~ /DumpGroupMembers/ ) { $typeDump = $STR{'groupMembers'};  }
+								$win->Tray->Change(-tip => "$STR{'Dump'} $typeDump $STR{'finished'}...");
+								$win->Tray->Change(-balloon_icon => 'info', -balloon_title => 'DumpItBlue',
+																	 -balloon_tip  => "$STR{'Dump'} $typeDump $STR{'finished'}...");
+								$win->Tray->ShowBalloon(1);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+}  #--- End loadDump
+
+#--------------------------#
+sub MenuShowQueue_Click
+#--------------------------#
+{
+	&loadQueue; # Load the queue
+  if ($winConfig->chRememberPos->Checked() and $CONFIG{'WINQUEUE_LEFT'} and $CONFIG{'WINQUEUE_TOP'}) {
+    $winQueue->Left($CONFIG{'WINQUEUE_LEFT'});
+    $winQueue->Top($CONFIG{'WINQUEUE_TOP'});
+  } else { $winQueue->Center(); }
+  $winQueue->Show();
+
+}  #--- End MenuShowQueue_Click
+
+#--------------------------#
+sub MenuConfig_Click
+#--------------------------#
+{
+  # Default tab is General options
+  $winConfig->configTab->SetCurSel(0);
+  &configTab_Change();
+  if ($winConfig->chRememberPos->Checked() and $CONFIG{'WINCONFIG_LEFT'} and $CONFIG{'WINCONFIG_TOP'}) {
+    $winConfig->Left($CONFIG{'WINCONFIG_LEFT'});
+    $winConfig->Top($CONFIG{'WINCONFIG_TOP'});
+  } else { $winConfig->Center(); }
+  $winConfig->Show();
+
+}  #--- End MenuConfig_Click
+
+#--------------------------#
+sub MenuHelp_Click
+#--------------------------#
+{
+  # Open Firefox to DumpItBlue page
+  $win->ShellExecute('open', $URL_DOC,'','',1) or
+	Win32::GUI::MessageBox($win, Win32::FormatMessage(Win32::GetLastError()), "$STR{'update3'} DumpItBlue",0x40010);
+
+}  #--- End MenuHelp_Click
+
+#--------------------------#
+sub MenuAbout_Click { &Tray_DblClick(); }
+#--------------------------#
+
+#--------------------------#
+sub MenuQuit_Click
+#--------------------------#
+{
+  $win->Tray->Remove();
+	&rememberPosWin(\$win, 'MAIN') if $winConfig->chRememberPos->Checked();
+  -1; # Exit signal
+
+}  #--- End MenuQuit_Click
+
+#--------------------------#
+sub winQueue_Resize
+#--------------------------#
+{
+  $winQueue->gridQueue->Width($winQueue->ScaleWidth()-10);
+  $winQueue->gridQueue->Height($winQueue->ScaleHeight()-45);
+	$winQueue->gridQueue->AutoSize();
+	$winQueue->gridQueue->ExpandLastColumn();
+	$winQueue->btnQueueRefresh->Top($winQueue->ScaleHeight()-35);
+	$winQueue->btnQueueRefresh->Left(($winQueue->ScaleWidth()-310)/2);
+	$winQueue->btnQueueProcess->Top($winQueue->ScaleHeight()-35);
+	$winQueue->btnQueueProcess->Left($winQueue->btnQueueRefresh->Left()+110);
+  return(0);
+
+}  #--- End winQueue_Resize
+
+#--------------------------#
+sub checkQueue
+#--------------------------#
+{
+  # Verify the queue directory
+  my $isQueue = 0;
+  if (-d "$USERDIR\\Queue\\" and opendir(DIR, "$USERDIR\\Queue\\")) {
+    while (readdir(DIR)) { if (/\.db$/) { $isQueue++; last; } }
+    close(DIR);
+  }
+  # There is at least one pending job in queue
+  if ($isQueue) {
+    my $answer = Win32::GUI::MessageBox($win, "$STR{'pendingJob'} ?\r\n\r\n$STR{'pendingJobWarn'}.", $STR{'Queue'}, 0x40024);
+		if ($answer == 7) { # Answer is no, delete the jobs
+			opendir(DIR, "$USERDIR\\Queue\\");
+			while (my $file = readdir(DIR)) {	unlink("$USERDIR\\Queue\\$file") if $file =~ /\.db$/; }
+			close(DIR);
+	  } 
+	}
+	
+}  #--- End checkQueue
+
+#--------------------------#
+sub loadQueue
+#--------------------------#
+{
+  # Load all jobs in Queue
+	$winQueue->gridQueue->DeleteNonFixedRows();
+	if (-d "$USERDIR\\Queue\\" and opendir(DIR, "$USERDIR\\Queue\\")) {
+		while (my $file = readdir(DIR)) {
+			if ($file =~ /\.db$/) {
+				my $dbFile = "$USERDIR\\Queue\\$file";
+				my $dsn    = "DBI:SQLite:dbname=$dbFile";
+				if (-f $dbFile and my $dbh = DBI->connect($dsn, undef, undef, { sqlite_unicode => 1})) {
+					my $process = (split/\./, $file)[0];
+					my $name    = $dbh->selectrow_array('SELECT value FROM INFOS WHERE key = ?', undef, 'filename');
+					my $url     = $dbh->selectrow_array('SELECT value FROM INFOS WHERE key = ?', undef, 'startingURL');
+					if (my $newLine = $winQueue->gridQueue->InsertRow($process, -1)) {
+						$winQueue->gridQueue->SetCellText( $newLine, 0, ""         );
+						$winQueue->gridQueue->SetCellType( $newLine, 0, GVIT_CHECK );
+						$winQueue->gridQueue->SetCellCheck($newLine, 0, 1);
+						$winQueue->gridQueue->SetCellText( $newLine, 1, $process );
+						$winQueue->gridQueue->SetCellText( $newLine, 2, $name );
+						$winQueue->gridQueue->SetCellText( $newLine, 3, $url);
+					}
+					undef $dbh;
+				}
+			}
+		}
+		$winQueue->btnQueueProcess->Enable() if $winQueue->gridQueue->GetRows() > 1;
+		# Refresh grid
+		$winQueue->gridQueue->AutoSize();
+		$winQueue->gridQueue->ExpandLastColumn();
+		$winQueue->gridQueue->SortCells(1, 1, \&sortQueue); # Sort on the datetime of the process name
+		$winQueue->gridQueue->Refresh();
+		close(DIR);
+	}
+  
+}  #--- End loadQueue
+
+#--------------------------#
+sub sortQueue
+#--------------------------#
+{
+  my ($a, $b) = @_;
+	# Compare unixtime in first column (Process, ex.: DumpAlbums-1502107644)
+	my $aDT = (split(/-/, $a))[1];
+	my $bDT = (split(/-/, $b))[1];
+  return ($aDT <=> $bDT);
+
+}  #--- End sortQueue
+
+#--------------------------#
+sub gridQueue_Click
+#--------------------------#
+{
+  # Local variables
+  my ($row, $column) = @_;
+  # Select
+  if (!$column) {
+    my $selStatus = $winQueue->gridQueue->GetCellCheck($row, 0);
+    if (!$row) {
+      if (!$selStatus) { # Check all
+				for (my $i = 0; $i < $winQueue->gridQueue->GetRows(); $i++) { $winQueue->gridQueue->SetCellCheck($i, 0, 1); }
+			} else { # Uncheck all
+				for (my $i = 0; $i < $winQueue->gridQueue->GetRows(); $i++) { $winQueue->gridQueue->SetCellCheck($i, 0, 0); }
+			}
+    } else {
+      if (!$selStatus) { $winQueue->gridQueue->SetCellCheck($row, 0, 1); } # Check
+      else             { $winQueue->gridQueue->SetCellCheck($row, 0, 0); } # Uncheck
+    }
+  }
+	my $nbrSel = 0;
+  for (my $i = 1; $i < $winQueue->gridQueue->GetRows(); $i++) {
+    $nbrSel++ if $winQueue->gridQueue->GetCellCheck($i, 0);
+  }
+	if ($nbrSel) { $winQueue->btnQueueProcess->Enable();  }
+	else         { $winQueue->btnQueueProcess->Disable(); }
+  return(1);
+
+}  #--- End gridQueue_Click
+
+#--------------------------#
+sub gridQueue_RClick
+#--------------------------#
+{
+  # Show popup menu
+  my ($row, $column) = @_;
+  my (@coord) = $winQueue->gridQueue->GetSelectedCellRange();
+  # Select the right entry if not selected or select has change
+  $winQueue->gridQueue->SetSelectedCellRange($row, 0, $row, 3)
+  if (($coord[0] and ($row < $coord[0])) or ($coord[2] and ($row > $coord[2])) or !$coord[0]);
+  my ($X, $Y) = Win32::GUI::GetCursorPos();
+	my $nbrRows = $winQueue->gridQueue->GetRows() - 1;
+	if ($nbrRows > 1) {
+    # Up button enabled if not the first one
+    if ($row != 1) { $gridQueueMenu->{moveUp}->Enabled(1); }
+    else           { $gridQueueMenu->{moveUp}->Enabled(0); }
+    # Down button enabled if not the last one
+    if ($row != $nbrRows) { $gridQueueMenu->{moveDown}->Enabled(1); }
+    else                  { $gridQueueMenu->{moveDown}->Enabled(0); }
+  }
+  $winQueue->TrackPopupMenu($gridQueueMenu->{gridQueueMenu},$X,$Y);
+	return(1);
+
+}  #--- End gridQueue_RClick
+
+#--------------------------#
+sub moveUp_Click
+#--------------------------#
+{
+  # Local variables
+  my $upRow   = ($winQueue->gridQueue->GetSelectedCellRange())[0];
+  my $downRow = $upRow - 1;
+  # Get selected row values
+  if ($downRow > 0) { # Not the first line
+    # Values to move up
+    my $upDatabase = $winQueue->gridQueue->GetCellText($upRow, 1);
+    my $upFilename = $winQueue->gridQueue->GetCellText($upRow, 2);
+    my $upURL			 = $winQueue->gridQueue->GetCellText($upRow, 3);
+    # Values to move down
+    my $downDatabase = $winQueue->gridQueue->GetCellText($downRow, 1);
+    my $downFilename = $winQueue->gridQueue->GetCellText($downRow, 2);
+    my $downURL			 = $winQueue->gridQueue->GetCellText($downRow, 3);
+    # Move values up
+    $winQueue->gridQueue->SetCellText($downRow, 1, $upDatabase);
+    $winQueue->gridQueue->SetCellText($downRow, 2, $upFilename);
+    $winQueue->gridQueue->SetCellText($downRow, 3, $upURL);
+    # Move values down
+    $winQueue->gridQueue->SetCellText($upRow, 1, $downDatabase);
+    $winQueue->gridQueue->SetCellText($upRow, 2, $downFilename);
+    $winQueue->gridQueue->SetCellText($upRow, 3, $downURL);
+    $winQueue->gridQueue->SetSelectedCellRange($downRow, 0, $downRow, 3);
+    $winQueue->gridQueue->Refresh();
+  }
+  return(1);
+  
+}  #--- End moveUp_Click
+
+#--------------------------#
+sub moveDown_Click
+#--------------------------#
+{
+  # Local variables
+  my $downRow = ($winQueue->gridQueue->GetSelectedCellRange())[0];
+  my $nbrRows = $winQueue->gridQueue->GetRows() - 1;
+  my $upRow   = $downRow + 1;
+  # Get selected row values
+  if ($downRow < $winQueue->gridQueue->GetRows()) { # Not the last line
+    # Values to move down
+    my $downDatabase = $winQueue->gridQueue->GetCellText($downRow, 1);
+    my $downFilename = $winQueue->gridQueue->GetCellText($downRow, 2);
+    my $downURL			 = $winQueue->gridQueue->GetCellText($downRow, 3);
+    # Values to move up
+    my $upDatabase = $winQueue->gridQueue->GetCellText($upRow, 1);
+    my $upFilename = $winQueue->gridQueue->GetCellText($upRow, 2);
+    my $upURL			 = $winQueue->gridQueue->GetCellText($upRow, 3);
+    # Move values down
+    $winQueue->gridQueue->SetCellText($upRow, 1, $downDatabase);
+    $winQueue->gridQueue->SetCellText($upRow, 2, $downFilename);
+    $winQueue->gridQueue->SetCellText($upRow, 3, $downURL);
+    # Move values up
+    $winQueue->gridQueue->SetCellText($downRow, 1, $upDatabase);
+    $winQueue->gridQueue->SetCellText($downRow, 2, $upFilename);
+    $winQueue->gridQueue->SetCellText($downRow, 3, $upURL);
+    $winQueue->gridQueue->SetSelectedCellRange($upRow, 0, $upRow, 3);
+    $winQueue->gridQueue->Refresh();
+  }
+  return(1);
+  
+}  #--- End moveDown_Click
+
+#--------------------------#
+sub queueDelete_Click
+#--------------------------#
+{
+	# Local variables
+	my $row     = ($winQueue->gridQueue->GetSelectedCellRange())[0];
+	my $process = $winQueue->gridQueue->GetCellText($row, 1);
+	if (-e "$USERDIR\\Queue\\$process\.db") {
+		unlink("$USERDIR\\Queue\\$process\.db");
+		$winQueue->gridQueue->DeleteRow($row);
+		$winQueue->gridQueue->Refresh();
+	}
+	if ($winQueue->gridQueue->GetRows() < 2) { $winQueue->btnQueueProcess->Disable(); }
+	return(1);
+	
+}  #--- End queueDelete_Click
+
+#--------------------------#
+sub btnQueueRefresh_Click
+#--------------------------#
+{
+	&loadQueue; # Load the queue
+
+}  #--- End btnQueueRefresh_Click
+
+#--------------------------#
+sub btnQueueProcess_Click
+#--------------------------#
+{
+	# Process all jobs in queue
+	&winQueue_Terminate();
+	my @queue;
+	for (my $i = 1; $i < $winQueue->gridQueue->GetRows(); $i++) {
+		if ($winQueue->gridQueue->GetCellCheck($i, 0)) {
+			my $process = $winQueue->gridQueue->GetCellText($i, 1);
+			my ($procName, $procID) = split(/\-/, $process);
+			push(@queue, 'DumpItBlue-process ' . "$procName $procID \"$PROGDIR\" \"$USERDIR\"");
+		}
+	}
+	my $i = 1;
+	foreach my $command (@queue) {
+    Win32::Process::Create(my $processObj, $PROGDIR .'\DumpItBlue-process.exe', $command, 0, NORMAL_PRIORITY_CLASS, $PROGDIR);
+    $processObj->Wait(INFINITE);
+		$winQueue->gridQueue->DeleteRow($i);
+	}
+	
+}  #--- End btnQueueProcess_Click
+
+#--------------------------#
+sub winQueue_Terminate
+#--------------------------#
+{
+	&rememberPosWin(\$winQueue, 'WINQUEUE')
+	if $winConfig->chRememberPos->Checked();
+	$winQueue->Hide();
+  return(0);
+
+}  #--- End winQueue_Terminate
+
+#--------------------------#
+sub configTab_Change
+#--------------------------#
+{
+  # Show General Options
+  if (!$winConfig->configTab->SelectedItem()) {
+    $winConfig->lblToolShadowT->Show();
+    $winConfig->lblToolT->Show();
+    $winConfig->btnExportLang->Show();
+    $winConfig->btnOpenUserDir->Show();		
+    $winConfig->btnCheckUpdate->Show();
+    $winConfig->chAutoUpdate->Show();
+    $winConfig->lblFuncShadowT->Show();
+    $winConfig->lblFuncT->Show();
+    $winConfig->chRememberPos->Show();
+    $winConfig->lblTimeToWait->Show();
+    $winConfig->tfTimeToWait->Show();
+    $winConfig->upTimeToWait->Show();
+    $winConfig->lblTimeToWait2->Show();
+    $winConfig->lblCharset->Show();
+    $winConfig->cbCharset->Show();
+    $winConfig->lblLoggingShadowT->Show();
+    $winConfig->lblLoggingT->Show();
+    $winConfig->chDebugLogging->Show();
+    $winConfig->btnOpenLog->Show();
+		$winConfig->btnClearLog->Show();
+		if ($DEBUG_FILE and -T $DEBUG_FILE) { $winConfig->btnOpenLog->Enable();	 $winConfig->btnClearLog->Enable();	 }
+		else																{ $winConfig->btnOpenLog->Disable(); $winConfig->btnClearLog->Disable(); }
+    $winConfig->lblLoadingShadowT->Hide();
+    $winConfig->lblLoadingT->Hide();
+    $winConfig->chOptAutoLoadScroll->Hide();
+    $winConfig->chOptScrollTop->Hide();
+    $winConfig->lblProcessingShadowT->Hide();
+    $winConfig->lblProcessingT->Hide();
+    $winConfig->chSilentProgress->Hide();
+    $winConfig->lblFinishingShadowT->Hide();
+    $winConfig->lblFinishingT->Hide();
+    $winConfig->chOptOpenReport->Hide();
+    $winConfig->chOptDontOpenReport->Hide();
+    $winConfig->chDelTempFiles->Hide();
+    $winConfig->chRememberSaveDir->Hide();
+	# Show Dump options
+  } else {
+    $winConfig->lblLoadingShadowT->Show();
+    $winConfig->lblLoadingT->Show();
+    $winConfig->chOptAutoLoadScroll->Show();
+    $winConfig->chOptScrollTop->Show();
+    $winConfig->lblProcessingShadowT->Show();
+    $winConfig->lblProcessingT->Show();
+    $winConfig->chSilentProgress->Show();
+    $winConfig->lblFinishingShadowT->Show();
+    $winConfig->lblFinishingT->Show();
+    $winConfig->chOptOpenReport->Show();
+    $winConfig->chOptDontOpenReport->Show();
+    $winConfig->chDelTempFiles->Show();
+    $winConfig->chRememberSaveDir->Show();
+    $winConfig->lblToolShadowT->Hide();
+    $winConfig->lblToolT->Hide();
+    $winConfig->btnExportLang->Hide();
+    $winConfig->btnOpenUserDir->Hide();	
+    $winConfig->btnCheckUpdate->Hide();
+    $winConfig->chAutoUpdate->Hide();
+    $winConfig->lblFuncShadowT->Hide();
+    $winConfig->lblFuncT->Hide();
+    $winConfig->chRememberPos->Hide();
+    $winConfig->lblTimeToWait->Hide();
+    $winConfig->tfTimeToWait->Hide();
+    $winConfig->upTimeToWait->Hide();
+    $winConfig->lblTimeToWait2->Hide();
+    $winConfig->lblCharset->Hide();
+    $winConfig->cbCharset->Hide();
+    $winConfig->lblLoggingShadowT->Hide();
+    $winConfig->lblLoggingT->Hide();
+    $winConfig->chDebugLogging->Hide();
+    $winConfig->btnOpenLog->Hide();
+		$winConfig->btnClearLog->Hide();
+	}
+
+}  #--- End configTab_Change
+
+#--------------------------#
+sub winConfig_Terminate
+#--------------------------#
+{
+	&rememberPosWin(\$winConfig, 'WINCONFIG') if $winConfig->chRememberPos->Checked();
+	$winConfig->Hide();
+  return(0);
+
+}  #--- End winConfig_Terminate
+
+#--------------------------#
+sub btnExportLang_Click
+#--------------------------#
+{
+  # Save strings in Lang.ini
+  open(LANG, ">:encoding(UTF-8)", $LANG_FILE);
+  flock(LANG, 2);
+  foreach my $cle (keys %STR) { print LANG "$cle = $STR{$cle}\n"; }
+  close(LANG);
+  # Open the page
+  $win->ShellExecute('open', $LANG_FILE,'','',1);
+
+}  #--- End btnExportLang_Click
+
+#--------------------------#
+sub btnOpenUserDir_Click
+#--------------------------#
+{
+  # Open Window Explorer
+  Win32::Process::Create(my $ProcessObj, "$ENV{'WINDIR'}\\explorer.exe", "explorer $USERDIR", 0, NORMAL_PRIORITY_CLASS, ".") if -d $USERDIR;
+
+}  #--- End btnOpenUserDir_Click
+
+#--------------------------#
+sub btnCheckUpdate_Click { &checkUpdate(1, $VERSION, \$win, \%STR); }
+#--------------------------#
+
+#--------------------------#
+sub chAutoUpdate_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chAutoUpdate->Checked()) {
+    $CONFIG{'AUTO_UPDATE'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'AUTO_UPDATE'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chAutoUpdate_Click
+
+#--------------------------#
+sub chRememberPos_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chRememberPos->Checked()) {
+    $CONFIG{'REMEMBER_POS'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'REMEMBER_POS'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chRememberPos_Click
+
+#--------------------------#
+sub tfTimeToWait_Change
+#--------------------------#
+{
+  # Remember
+	if (my $timeToWait = $winConfig->tfTimeToWait->Text() and exists($CONFIG{'TIME_TO_WAIT'})) {
+		$CONFIG{'TIME_TO_WAIT'} = $winConfig->tfTimeToWait->Text();
+		&saveConfig;
+	}
+	
+}  #--- End tfTimeToWait_Change
+
+#--------------------------#
+sub cbCharset_Change
+#--------------------------#
+{
+	# Save the choice
+  $CONFIG{'CHARSET'} = $winConfig->cbCharset->GetString($winConfig->cbCharset->GetCurSel());
+  &saveConfig;
+
+}  #--- End cbCharset_Change
+
+#--------------------------#
+sub chDebugLogging_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chDebugLogging->Checked()) {
+    $CONFIG{'DEBUG_LOGGING'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'DEBUG_LOGGING'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chDebugLogging_Click
+
+#--------------------------#
+sub btnOpenLog_Click
+#--------------------------#
+{
+  # Open file with default program
+  if ($DEBUG_FILE and -T $DEBUG_FILE) {
+    $win->ShellExecute('open', $DEBUG_FILE,'','',1) or
+    Win32::GUI::MessageBox($win, "$STR{'Error'}: ".Win32::FormatMessage(Win32::GetLastError()), $STR{'Error'}, 0x40010);
+  }
+
+}  #--- End btnOpenLog_Click
+
+#--------------------------#
+sub btnClearLog_Click
+#--------------------------#
+{
+  # Open file with default program
+  if ($DEBUG_FILE and -T $DEBUG_FILE and unlink($DEBUG_FILE)) {
+    $winConfig->btnOpenLog->Disable();
+		$winConfig->btnClearLog->Disable();
+  }
+
+}  #--- End btnClearLog_Click
+
+#--------------------------#
+sub chOptAutoLoadScroll_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chOptAutoLoadScroll->Checked()) {
+    $CONFIG{'AUTO_LOAD_SCROLL'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'AUTO_LOAD_SCROLL'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chOptAutoLoadScroll_Click
+
+#--------------------------#
+sub chOptScrollTop_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chOptScrollTop->Checked()) {
+    $CONFIG{'OPT_SCROLL_TOP'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'OPT_SCROLL_TOP'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chOptScrollTop_Click
+
+#--------------------------#
+sub chRememberSaveDir_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chRememberSaveDir->Checked()) {
+    $CONFIG{'REMEMBER_SAVE_DIR'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'REMEMBER_SAVE_DIR'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chRememberSaveDir_Click
+
+#--------------------------#
+sub chSilentProgress_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chSilentProgress->Checked()) {
+    $CONFIG{'SILENT_PROGRESS'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'SILENT_PROGRESS'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chSilentProgress_Click
+
+#--------------------------#
+sub chOptOpenReport_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chOptOpenReport->Checked()) {
+		$winConfig->chOptDontOpenReport->Checked(1);
+		$winConfig->chOptDontOpenReport->Show();
+		$CONFIG{'DONT_OPEN_REPORT'} = 1;
+    $CONFIG{'OPEN_REPORT'}			= 1;
+    &saveConfig;
+  } else {
+		$winConfig->chOptDontOpenReport->Checked(0);
+		$winConfig->chOptDontOpenReport->Hide();
+		$CONFIG{'DONT_OPEN_REPORT'} = 0;
+    $CONFIG{'OPEN_REPORT'}			= 0;
+    &saveConfig;
+  }
+
+}  #--- End chOptOpenReport_Click
+
+#--------------------------#
+sub chOptDontOpenReport_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chOptDontOpenReport->Checked()) {
+    $CONFIG{'DONT_OPEN_REPORT'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'DONT_OPEN_REPORT'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chOptDontOpenReport_Click
+
+#--------------------------#
+sub chDelTempFiles_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($winConfig->chDelTempFiles->Checked()) {
+    $CONFIG{'DEL_TEMP_FILES'} = 1;
+    &saveConfig;
+  } else {
+    $CONFIG{'DEL_TEMP_FILES'} = 0;
+    &saveConfig;
+  }
+
+}  #--- End chDelTempFiles_Click
+
+
+#--------------------------#
+sub exploreDir
+#--------------------------#
+{
+	# Open Window Explorer
+	my $dir = shift;
+  Win32::Process::Create(my $ProcessObj, "$ENV{'WINDIR'}\\explorer.exe", "explorer $dir", 0, NORMAL_PRIORITY_CLASS, ".") if $dir and -d $dir;
+	
+}  #--- End exploreDir
+
+#--------------------------#
+sub debug
+#--------------------------#
+{
+  # Local variables
+  my ($refMsg) = @_;
+  my $dateStr  = &formatDate(time);
+  # Save error msg in debug log file
+	my $fhLog;
+  if (-e $DEBUG_FILE) { open($fhLog,">>$DEBUG_FILE"); }
+  else                { open($fhLog,">$DEBUG_FILE");  }
+  flock($fhLog, 2);
+  print $fhLog "$dateStr\t[DumpItBlue.exe]\t$refMsg\n";
+  close($fhLog);
+
+}  #--- End debug
+
+#--------------------------#
+sub formatDate
+#--------------------------#
+{
+  # Local variables
+  my $unixtime = shift;
+  # Convert to string, local timezone
+  if ($unixtime =~ /\./) { $unixtime = (split(/\./, $unixtime))[0]; }
+  my ($s,$min,$hr,$d,$m,$y,$weekday,$ha,$isDST) = localtime($unixtime);
+	return(sprintf("%04d\-%02d\-%02d %02d:%02d:%02d", $y+1900, $m+1, $d, $hr, $min, $s));
+
+}  #--- End formatDate
+
+#--------------------------#
+sub rememberPosWin
+#--------------------------#
+{
+  # Local variables
+  my ($refSelWin, $selWin) = @_;
+	# Remember position
+  my $winLeft = $$refSelWin->AbsLeft();
+  my $winTop  = $$refSelWin->AbsTop();
+  $CONFIG{$selWin.'_LEFT'} = $winLeft;
+  $CONFIG{$selWin.'_TOP'}  = $winTop;
+  &saveConfig;
+  
+}  #--- End rememberPosWin
+
+#--------------------------#
+sub saveConfig
+#--------------------------#
+{
+  # Save configuration hash values
+  open(CONFIG,">$CONFIG_FILE");
+  flock(CONFIG, 2);
+  foreach my $cle (keys %CONFIG) { print CONFIG "$cle = $CONFIG{$cle}\n"; }
+  close(CONFIG);  
+
+}  #--- End saveConfig
+
+#--------------------------#
+sub loadConfig
+#--------------------------#
+{
+  # If ini file exists
+  if (-T $CONFIG_FILE) {
+    # Open and load config values
+    open(CONFIG, $CONFIG_FILE);
+    my @tab = <CONFIG>;
+    close(CONFIG);
+    foreach (@tab) {
+      chomp($_);
+      my ($key, $value) = split(/ = /, $_);
+      $CONFIG{$key}     = $value if $key;
+    }
+  }
+  # Start minimized
+  if (exists($CONFIG{'START_MINIMIZED'}))   { $win->chStartMinimized->Checked($CONFIG{'START_MINIMIZED'});                  }
+  else                                      { $win->chStartMinimized->Checked(0);                                           } # Default is not checked
+  # General settings
+  if (exists($CONFIG{'AUTO_UPDATE'}))       { $winConfig->chAutoUpdate->Checked($CONFIG{'AUTO_UPDATE'});                    }
+  else                                      { $winConfig->chAutoUpdate->Checked(1);   $CONFIG{'AUTO_UPDATE'} = 1;           } # Default is checked
+  if (exists($CONFIG{'REMEMBER_POS'}))      { $winConfig->chRememberPos->Checked($CONFIG{'REMEMBER_POS'});                  }
+  else                                      { $winConfig->chRememberPos->Checked(0);                                        } # Default is not checked
+  if (exists($CONFIG{'TIME_TO_WAIT'}))      { $winConfig->upTimeToWait->SetPos($CONFIG{'TIME_TO_WAIT'});                    }
+  else                                      { $winConfig->upTimeToWait->SetPos(2); $CONFIG{'TIME_TO_WAIT'} =  2;            } # Default value is 2
+  if (exists($CONFIG{'CHARSET'}))           { $winConfig->cbCharset->SetCurSel($winConfig->cbCharset->FindString($CONFIG{'CHARSET'})); }
+  else                                      { $winConfig->cbCharset->SetCurSel(0);    $CONFIG{'CHARSET'} = 'cp1252';        } # Default is cp1252
+  if (exists($CONFIG{'DEBUG_LOGGING'}))     { $winConfig->chDebugLogging->Checked($CONFIG{'DEBUG_LOGGING'});                }
+  else                                      { $winConfig->chDebugLogging->Checked(0); $CONFIG{'DEBUG_LOGGING'} = 0;         } # Default is not checked
+  # Dump options
+  if (exists($CONFIG{'AUTO_LOAD_SCROLL'}))  { $winConfig->chOptAutoLoadScroll->Checked($CONFIG{'AUTO_LOAD_SCROLL'});        }
+  else                                      { $winConfig->chOptAutoLoadScroll->Checked(1); $CONFIG{'AUTO_LOAD_SCROLL'} = 1; } # Default is checked
+  if (exists($CONFIG{'OPT_SCROLL_TOP'}))    { $winConfig->chOptScrollTop->Checked($CONFIG{'OPT_SCROLL_TOP'});               }
+  else                                      { $winConfig->chOptScrollTop->Checked(1); $CONFIG{'OPT_SCROLL_TOP'} = 1;        } # Default is checked
+  if (exists($CONFIG{'REMEMBER_SAVE_DIR'})) { $winConfig->chRememberSaveDir->Checked($CONFIG{'REMEMBER_SAVE_DIR'});         }
+  else                                      { $winConfig->chRememberSaveDir->Checked(1); $CONFIG{'REMEMBER_SAVE_DIR'} = 1;  } # Default value is checked
+  if (exists($CONFIG{'SILENT_PROGRESS'}))   { $winConfig->chSilentProgress->Checked($CONFIG{'SILENT_PROGRESS'});            }
+  else                                      { $winConfig->chSilentProgress->Checked(1); $CONFIG{'SILENT_PROGRESS'} = 1;     } # Default value is checked
+  if (exists($CONFIG{'OPEN_REPORT'}))       { $winConfig->chOptOpenReport->Checked($CONFIG{'OPEN_REPORT'});                 }
+  else                                      { $winConfig->chOptOpenReport->Checked(1); $CONFIG{'OPEN_REPORT'} = 1;          } # Default value is checked
+  if (exists($CONFIG{'DONT_OPEN_REPORT'}))  { $winConfig->chOptDontOpenReport->Checked($CONFIG{'DONT_OPEN_REPORT'});        }
+  else                                      { $winConfig->chOptDontOpenReport->Checked(1); $CONFIG{'DONT_OPEN_REPORT'} = 1; } # Default value is checked
+  if (exists($CONFIG{'DEL_TEMP_FILES'}))    { $winConfig->chDelTempFiles->Checked($CONFIG{'DEL_TEMP_FILES'});               }
+  else                                      { $winConfig->chDelTempFiles->Checked(1); $CONFIG{'DEL_TEMP_FILES'} = 1;        } # Default is checked
+  &saveConfig;
+
+}  #--- End loadConfig
+
+#--------------------------#
+sub checkUpdate
+#--------------------------#
+{
+  # Local variables
+  my ($confirm) = @_;
+  # Download the version file  
+  my $ua = new LWP::UserAgent;
+  $ua->agent("DumpItBlueUpdate $VERSION");
+  $ua->default_header('Accept-Language' => 'en');
+  my $req = new HTTP::Request GET => $URL_VER;
+  my $res = $ua->request($req);
+  # Success, compare versions
+  if ($res->is_success) {
+    my $status  = $res->code;
+    my $content = $res->content;
+    my $currVer;
+    $currVer = $1 if $content =~ /([\d\.]+)/i;
+    # No update available
+    if ($currVer le $VERSION) {
+      Win32::GUI::MessageBox($win, $STR{'update1'}, $STR{'update2'}, 0x40040) if $confirm; # Up to date
+    } else {
+      $win->Show();
+      # Download with browser
+      my $answer = Win32::GUI::MessageBox($win, "$STR{'update4'} $currVer $STR{'update5'} ?", $STR{'update3'}, 0x40024);
+      if ($answer == 6) { # Open XL-Tools page
+        $win->ShellExecute('open', $URL_TOOL,'','',1) or
+				Win32::GUI::MessageBox($win, Win32::FormatMessage(Win32::GetLastError()), "$STR{'update3'} DumpItBlue", 0x40010);
+      }
+    }
+  } else { # Error 
+    my $status  = $res->code;
+    my $error   = $res->status_line;
+    Win32::GUI::MessageBox($win, "$STR{'Error'}: $STR{'returnedCode'} = [$status]; $STR{'returnedError'} = [$error].", "$STR{'update2'}: $STR{'errConnection'}", 0x40010);
+  }
+
+}  #--- End checkUpdate
+
+#------------------------------------------------------------------------------#

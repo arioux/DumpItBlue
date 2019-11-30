@@ -1,0 +1,1977 @@
+#!/usr/bin/perl
+# Perl - v: 5.16.3
+#------------------------------------------------------------------------------#
+# DumpItBlue-Load.plw     : DumpItBlue process for Load Dump interface
+# WebSite                 : http://le-tools.com/DumpItBlue.html
+# Documentation           : http://le-tools.com/DumpItBlueDoc.html
+# SourceForge             : https://sourceforge.net/p/dumpitblue
+# GitHub                  : https://github.com/arioux/DumpItBlue
+# Creation                : 2019-03-16
+# Modified                : 2019-05-26
+my $VERSION               = '7.0.2';
+# Author                  : Alain Rioux (admin@le-tools.com)
+#
+# Copyright (C) 2015-2019  Alain Rioux (le-tools.com)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#------------------------------------------------------------------------------#
+
+#------------------------------------------------------------------------------#
+# Modules
+#------------------------------------------------------------------------------#
+use strict;
+use warnings;
+use threads;
+use threads::shared;
+use utf8;
+use arybase;
+use Encode qw(encode decode);
+use DBI;
+use Log::Log4perl qw(:easy);
+use Future::HTTP::Tiny;
+use Chrome::DevToolsProtocol::Transport::AnyEvent;
+use WWW::Mechanize::Chrome;
+use HTML::DOM;
+use HTML::Entities;
+use Win32::API();
+use Win32::GUI;
+use Win32::GUI qw( WS_POPUP WS_CAPTION WS_THICKFRAME WS_EX_TOPMOST );
+use Win32::GUI::BitmapInline();
+use Win32::GUI::Grid;
+use Win32::Process;
+require "DumpItBlue-LoadGraph.pl";
+require "DumpItBlueLang.pl";
+
+#------------------------------------------------------------------------------#
+# Graphic elements
+#------------------------------------------------------------------------------#
+my ($winICO, $logoBmp, $albumBmp, $friendsBmp, $contribBmp, $browseBmp, $explorerBmp,
+    $refresh16) = &loadGraph();
+
+#------------------------------------------------------------------------------#
+# Global variables
+#------------------------------------------------------------------------------#
+my $REF_ARG     = \@ARGV;                                                      # Parameters (Ex. : Friends "E:\DevPerl\DumpItBlue" "C:\Users\User\AppData\Roaming\DumpItBlue")
+my $TYPEDUMP    = $$REF_ARG[0];                                                # Type of Dump Name (ex.: Albums)
+my $PROGDIR     = $$REF_ARG[1];                                                # Program directory
+my $USERDIR     = $$REF_ARG[2];                                                # User path
+my $CONFIG_FILE  = "$USERDIR\\DumpItBlue.ini";                                 # Configuration file
+my $LANG_FILE    = "$USERDIR\\Lang.ini";                                       # Langage file
+my $DEBUG_FILE   = "$USERDIR\\debug.log";                                			 # Log for error
+my %CONFIG;                                                                    # Configuration
+my %STR;                                                                       # Strings for GUI
+my $ARROW       :shared;                                                       # Arrow pointer
+my $HOURGLASS   :shared;                                                       # Hourglass pointer
+my $THR;                                                                       # Thread
+my $WIN;                                                                       # Window (ex. : Dump Albums)
+
+#------------------------------------------------------------------------------#
+# Strings
+#------------------------------------------------------------------------------#
+&loadDefaultStr(\%STR); 																											 # Load default language (en)
+&loadStr(\%STR, $LANG_FILE) if -e $LANG_FILE and -T $LANG_FILE; 							 # If language file, load translated strings
+
+#------------------------------------------------------------------------------#
+# Main window
+#------------------------------------------------------------------------------#
+# Fonts
+sub LOGPIXELSX() {88}
+sub getDPI { return(Win32::GUI::DC->new()->GetDeviceCaps(LOGPIXELSX)); }
+my $DPI = &getDPI();
+my $fontGB;
+my $fontGB2;
+my $font8;
+my $font10;
+my $font10t;
+# Larger size (125% and 150%)
+if ($DPI >= 120) {
+  $fontGB  = new Win32::GUI::Font(-name => 'Arial', -size => 10, -bold => 1);
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 10, -bold => 1, -underline => 1);
+  $font8   = new Win32::GUI::Font(-name => 'Arial', -size =>  6);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size =>  8);
+  $font10t = new Win32::GUI::Font(-name => 'Arial', -size =>  8, -underline => 1);
+# Normal size
+} else {
+  $fontGB  = new Win32::GUI::Font(-name => 'Arial', -size => 12, -bold => 1);
+  $fontGB2 = new Win32::GUI::Font(-name => 'Arial', -size => 12, -bold => 1, -underline => 1);
+  $font8   = new Win32::GUI::Font(-name => 'Arial', -size =>  8);
+  $font10  = new Win32::GUI::Font(-name => 'Arial', -size => 10);
+  $font10t = new Win32::GUI::Font(-name => 'Arial', -size => 10, -underline => 1);
+}
+# Load Pointers
+my $loadImage = new Win32::API('user32', 'LoadImage', ['N','N','I','I','I','I'],'N');
+$HOURGLASS    = $loadImage->Call(0, 32514, 2, 0, 0, 0x8040);
+$ARROW        = $loadImage->Call(0, 32512, 2, 0, 0, 0x8040);
+# Sizes
+my $WIN_WIDTH  = 0;
+my $WIN_HEIGHT = 0;
+if    ($TYPEDUMP eq 'Albums'       ) { $WIN_WIDTH = 800; $WIN_HEIGHT = 350; }
+elsif ($TYPEDUMP eq 'Friends'      ) { $WIN_WIDTH = 800; $WIN_HEIGHT = 315; }
+elsif ($TYPEDUMP eq 'MutualFriends') { $WIN_WIDTH = 800; $WIN_HEIGHT = 180; }
+elsif ($TYPEDUMP eq 'Contrib'      ) { $WIN_WIDTH = 800; $WIN_HEIGHT = 380; }
+elsif ($TYPEDUMP eq 'Comments'     ) { $WIN_WIDTH = 800; $WIN_HEIGHT = 350; }
+elsif ($TYPEDUMP eq 'GroupMembers' ) { $WIN_WIDTH = 800; $WIN_HEIGHT = 180; }
+# Position
+my $screen = Win32::GUI::GetDesktopWindow(); # Screen resolution
+my $scrnX  = Win32::GUI::Width($screen);     # Width
+my $scrnY  = Win32::GUI::Height($screen);    # Height
+my $WIN_X  = ($scrnX - $WIN_WIDTH)  / 2;
+my $WIN_Y  = ($scrnY - $WIN_HEIGHT) / 2;
+# Title
+my $WIN_TITLE = $STR{'Dump'}.' ';
+if    ($TYPEDUMP eq 'Albums'       ) { $WIN_TITLE .= $STR{'Albums'};        }
+elsif ($TYPEDUMP eq 'Friends'      ) { $WIN_TITLE .= $STR{'Friends'};       }
+elsif ($TYPEDUMP eq 'MutualFriends') { $WIN_TITLE .= $STR{'MutualFriends'}; }
+elsif ($TYPEDUMP eq 'Contrib'      ) { $WIN_TITLE .= $STR{'contributors'};  }
+elsif ($TYPEDUMP eq 'Comments'     ) { $WIN_TITLE .= $STR{'Comments'};      }
+elsif ($TYPEDUMP eq 'GroupMembers' ) { $WIN_TITLE .= $STR{'groupMembers'};  }
+# Logo
+my $WIN_LOGO;
+if    ($TYPEDUMP eq 'Albums'       ) { $WIN_LOGO = $albumBmp;   }
+elsif ($TYPEDUMP eq 'Friends'      ) { $WIN_LOGO = $friendsBmp; }
+elsif ($TYPEDUMP eq 'MutualFriends') { $WIN_LOGO = $friendsBmp; }
+elsif ($TYPEDUMP eq 'Contrib'      ) { $WIN_LOGO = $contribBmp; }
+elsif ($TYPEDUMP eq 'Comments'     ) { $WIN_LOGO = $contribBmp; }
+elsif ($TYPEDUMP eq 'GroupMembers' ) { $WIN_LOGO = $friendsBmp; }
+# Base controls
+$WIN = Win32::GUI::Window->new(       -name        => 'win'                   ,
+                                      -text        => $WIN_TITLE              ,
+                                      -pos         => [$WIN_X, $WIN_Y]        ,
+                                      -size        => [$WIN_WIDTH,$WIN_HEIGHT],
+                                      -minsize		 => [$WIN_WIDTH,$WIN_HEIGHT],
+                                      -background  => [255, 255, 255]         ,
+                                      -hasmaximize => 1                       ,
+                                      -hasminimize => 1                       ,
+                                      -helpbutton  => 0                       ,
+                                      -resizable   => 1                       ,
+                                      -dialogui    => 1                       , );
+$WIN->SetIcon($winICO);
+$WIN->AddLabel(     -name         => 'lblLogo'       ,
+                    -size         => [128,128]       ,
+                    -pos          => [  5,  5]       ,
+                    -bitmap       => $WIN_LOGO       ,
+                    -background   => [255, 255, 255] , );
+$WIN->AddLabel(     -name         => 'lblFilename'        ,
+                    -size         => [ 75, 22]            ,
+                    -pos          => [140, 18]            ,
+                    -text         => $STR{'Filename'}.':' ,
+                    -background   => [255, 255, 255]      ,
+                    -font         => $font10              , );
+$WIN->AddTextfield( -name         => 'tfFilename'         ,
+                    -size         => [332, 22]            ,
+                    -pos          => [220, 15]            ,
+                    -tabstop			=> 1                    , );
+$WIN->AddCombobox(  -name       	=> 'cbFormat'           ,
+                    -size       	=> [ 55, 22]            ,
+                    -pos        	=> [555, 15]            ,
+                    -dropdownlist => 1                    ,
+                    -vscroll    	=> 1                    ,
+                    -tabstop    	=> 1                    , );
+$WIN->cbFormat->Add('XLSX', 'HTML', 'TXT');
+$WIN->AddTextfield( -name         => 'tfPageType'         , # Hidden field
+                    -size         => [440, 22]            ,
+                    -pos          => [220, 15]            ,
+                    -visible      => 0                    , );
+$WIN->AddTextfield( -name         => 'tfCurrURL'          , # Hidden field
+                    -size         => [440, 22]            ,
+                    -pos          => [220, 15]            ,
+                    -visible      => 0                    , );
+$WIN->AddLabel(     -name         => 'lblDirSave'         ,
+                    -size         => [ 75, 22]            ,
+                    -pos          => [140, 48]            ,
+                    -text         => $STR{'Directory'}.':',
+                    -background   => [255, 255, 255]      ,
+                    -font         => $font10              , );
+$WIN->AddTextfield( -name         => 'tfDirSave'          ,
+                    -size         => [342, 22]            ,
+                    -pos          => [220, 45]            ,
+                    -tabstop			=> 1                    , );
+$WIN->AddButton(    -name         => 'btnDirSave'         ,
+                    -size         => [ 22, 22]            ,
+                    -pos          => [564, 45]            ,
+                    -bitmap       => $browseBmp           ,
+                    -tip          => $STR{'SelectDir'}    ,
+                    -tabstop			=> 1                    , );
+$WIN->AddButton(    -name         => 'btnBrowseDirSave'   ,
+                    -size         => [ 22, 22]            ,
+                    -pos          => [588, 45]            ,
+                    -bitmap       => $explorerBmp         ,
+                    -tip          => $STR{'browseFolder'} ,
+                    -tabstop			=> 1                    , );
+$WIN->AddLabel(     -name       	=> 'lblOpt'             ,
+                    -size       	=> [ 75, 22]            ,
+                    -pos        	=> [140, 75]            ,
+                    -text       	=> $STR{'Options'}.':'  ,
+                    -font       	=> $font10              ,
+                    -background 	=> [255, 255, 255]      , );
+$WIN->AddCheckbox(  -name       	=> 'chProfileIcons'     ,
+                    -size       	=> [170, 20]            ,
+                    -pos        	=> [220, 75]            ,
+                    -text       	=> "$STR{'Include'} $STR{'profileIcons'}",
+                    -background 	=> [255, 255, 255]      ,
+                    -font       	=> $font10              ,
+                    -tabstop    	=> 1                    ,
+                    -visible      => 0                    , );
+$WIN->AddCheckbox(  -name       	=> 'chAutoScroll'       ,
+                    -size       	=> [155, 22]            ,
+                    -pos        	=> [395, 74]            ,
+                    -text       	=> $STR{'AutoScroll'}		,
+                    -background 	=> [255, 255, 255]      ,
+                    -font       	=> $font10              ,
+                    -tabstop    	=> 1                    ,
+                    -visible      => 0                    , );
+$WIN->AddLabel(     -name         => 'lblInProgress'      ,
+                    -size         => [200, 22]            ,
+                    -pos          => [555, 77]            ,
+                    -font         => $font10              ,
+                    -foreground   => [0, 153, 0]          ,
+                    -background   => [255, 255, 255]      ,
+                    -visible      => 1                    , );
+$WIN->AddButton(    -name         => 'btnRefresh'         ,
+                    -size         => [ 22, 22]            ,
+                    -pos          => [758, 75]            ,
+                    -bitmap       => $refresh16           ,
+                    -tip          => $STR{'ReloadPage'}   ,
+                    -tabstop      => 1                    , );
+$WIN->AddButton(    -name       	=> 'btnDumpNow'         ,
+                    -size       	=> [150, 30]            ,
+                    -pos        	=> [245,310]            ,
+                    -text       	=> $STR{'DumpNow'}      ,
+                    -font       	=> $font10              ,
+                    -disabled   	=> 1                    ,
+                    -ok         	=> 1                    ,
+                    -default    	=> 1                    ,
+                    -tabstop			=> 1                    , );
+$WIN->AddButton(    -name         => 'btnAddQueue'        ,
+                    -size         => [150, 30]            ,
+                    -pos          => [400,310]            ,
+                    -text         => $STR{'AddToQueue'}.' >>',
+                    -font         => $font10              ,
+                    -disabled     => 1                    ,
+                    -tabstop      => 1                    , );
+# Albums grid
+if    ($TYPEDUMP eq 'Albums' or $TYPEDUMP eq 'Contrib' or $TYPEDUMP eq 'Comments') {
+  $WIN->AddGrid (                   -name         => 'GridAlbums'                   ,
+                                    -parent       => $WIN                           ,
+                                    -pos          => [140,100]                      ,
+                                    -size         => [630,145]                      ,
+                                    -fixedrows    => 1                              ,
+                                    -fixedcolumns => 0                              ,
+                                    -editable     => 0                              ,
+                                    -tabstop			=> 1															, );
+  $WIN->GridAlbums->SetListMode(1);
+  $WIN->GridAlbums->SetHeaderSort();
+  # Header Dump albums grid
+  $WIN->GridAlbums->SetRows(1);
+  $WIN->GridAlbums->SetColumns(4); # 1: checkbox, 2: Album name, 3e: Album url, 4e: Album id (hidden)
+  $WIN->GridAlbums->SetCellText(0, 0, ''        );
+  $WIN->GridAlbums->SetCellType(0, 0, GVIT_CHECK);
+  $WIN->GridAlbums->SetCellCheck(0, 0, 1);
+  $WIN->GridAlbums->SetCellText(0, 1, $STR{'albumNames'});
+  $WIN->GridAlbums->SetCellText(0, 3, $STR{'albumURLs'});
+  $WIN->GridAlbums->SetColumnWidth(0, 25);
+  $WIN->GridAlbums->SetColumnWidth(1, 80);
+  $WIN->GridAlbums->SetColumnWidth(2, 0);
+  $WIN->GridAlbums->ExpandLastColumn();
+  if ($TYPEDUMP eq 'Contrib' or $TYPEDUMP eq 'Comments') {
+    $WIN->chProfileIcons->Show();
+    $WIN->chAutoScroll->Show();
+    $WIN->GridAlbums->Show();
+    $WIN->AddTextfield(-name       	=> 'tfStartURL'						,
+                      -size       	=> [527, 22]              ,
+                      -pos        	=> [220,127]              ,
+                      -font         => $font10                ,
+                      -visible    	=> 0                      , ); # Hidden
+    $WIN->AddTextfield(-name       	=> 'tfProfilID'           ,
+                      -size       	=> [332, 22]              ,
+                      -pos        	=> [220,127]              ,
+                      -visible    	=> 0                      , ); # Hidden
+    $WIN->AddLabel(   -name         => 'lblPages'							,
+                      -size         => [ 75, 22]              ,
+                      -pos          => [140,129]              ,
+                      -text         => $STR{'Pages'}.':'    	,
+                      -font         => $font10                ,
+                      -background   => [255, 255, 255]        , );
+    $WIN->AddCheckbox(-name       	=> 'chPageCurr'           ,
+                      -size       	=> [120, 20]              ,
+                      -pos        	=> [220,127]              ,
+                      -text       	=> $STR{'CurrPage'}      	,
+                      -background 	=> [255, 255, 255]        ,
+                      -font       	=> $font10                ,
+                      -tabstop    	=> 1                      ,
+                      -checked    	=> 1                      , );
+    $WIN->AddButton(  -name         => 'btnAlbumsRefresh'			,
+                      -size         => [ 22, 22]              ,
+                      -pos          => [768,124]              ,
+                      -bitmap       => $refresh16             ,
+                      -tip          => $STR{'ReloadPage'}     ,
+                      -disabled			=> 1                      ,
+                      -tabstop      => 1                      , );
+    $WIN->AddCheckbox(-name       	=> 'chAlbums'          		,
+                      -size       	=> [300, 20]              ,
+                      -pos        	=> [345,127]              ,
+                      -text       	=> $STR{'PicPages'}				,
+                      -background 	=> [255, 255, 255]        ,
+                      -font       	=> $font10                ,
+                      -disabled			=> 1											,
+                      -tabstop    	=> 1                      ,
+                      -checked    	=> 0                      , );
+  }
+}
+# Specific controls
+if    ($TYPEDUMP eq 'Albums'       ) { # Dump Albums
+  $WIN->AddCheckbox(                -name         => 'chAlbumsOpenDir'              ,
+                                    -size         => [210, 20]                      ,
+                                    -pos          => [220, 74]                      ,
+                                    -text         => $STR{'openAlbumDir'}           ,
+                                    -background   => [255, 255, 255]                ,
+                                    -font         => $font10                        ,
+                                    -tabstop			=> 1															, );
+  $WIN->AddLabel(							      -name       	=> 'lblAlbumsInc'                	,
+                                    -size       	=> [ 75, 22]                      ,
+                                    -pos        	=> [140,254]                      ,
+                                    -text       	=> $STR{'Include'}.':'         		,
+                                    -font       	=> $font10                        ,
+                                    -background 	=> [255, 255, 255]                , );
+  $WIN->AddCheckbox(					      -name         => 'chAlbumsIncSmall'             ,
+                                    -size       	=> [120, 20]                      ,
+                                    -pos        	=> [220,250]                      ,
+                                    -background 	=> [255, 255, 255]                ,
+                                    -text       	=> $STR{'SmallPic'}       				,
+                                    -font       	=> $font10                        ,
+                                    -checked    	=> 1                              ,
+                                    -tabstop    	=> 1                              , );
+  $WIN->AddCheckbox(					      -name         => 'chAlbumsIncLarge'             ,
+                                    -size       	=> [120, 20]                      ,
+                                    -pos        	=> [345,250]                      ,
+                                    -background 	=> [255, 255, 255]                ,
+                                    -text       	=> $STR{'LargePic'}       				,
+                                    -font       	=> $font10                        ,
+                                    -tabstop    	=> 1                              , );
+  $WIN->AddCheckbox(                -name         => 'chPublishDate'                ,
+                                    -size         => [210, 20]                      ,
+                                    -pos          => [565,250]                      ,
+                                    -text         => $STR{'chPublishDate'}          ,
+                                    -background   => [255, 255, 255]                ,
+                                    -font         => $font10                        ,
+                                    -tabstop			=> 1															, );
+} elsif ($TYPEDUMP eq 'Friends'      ) {
+  $WIN->chProfileIcons->Show();
+	$WIN->AddGrid (                     -name         => 'GridFriends'                ,
+																			-pos          => [140,100]                    ,
+																			-size         => [640,137]                    ,
+																			-fixedrows    => 1                            ,
+																			-fixedcolumns => 0                            ,
+																			-editable     => 0                            , );
+	$WIN->GridFriends->SetListMode(1);
+	$WIN->GridFriends->SetHeaderSort();
+	# Header Dump friends grid
+	$WIN->GridFriends->SetRows(1);
+	$WIN->GridFriends->SetColumns(4); # 1: checkbox, 2: Category name, 3e: Category Id (hidden), 4e: Category url
+	$WIN->GridFriends->SetCellText(0, 0, ''        );
+	$WIN->GridFriends->SetCellType(0, 0, GVIT_CHECK);
+	$WIN->GridFriends->SetCellCheck(0, 0, 1);
+	$WIN->GridFriends->SetCellText(0, 1, $STR{'Category'});
+	$WIN->GridFriends->SetCellText(0, 3, $STR{'url'});
+	$WIN->GridFriends->SetColumnWidth(0, 25);
+	$WIN->GridFriends->SetColumnWidth(1, 80);
+	$WIN->GridFriends->SetColumnWidth(2, 0);
+	$WIN->GridFriends->ExpandLastColumn();
+} elsif ($TYPEDUMP eq 'MutualFriends') {
+  $WIN->btnRefresh->Hide();
+  $WIN->chProfileIcons->Show();
+  $WIN->chAutoScroll->Show();
+} elsif ($TYPEDUMP eq 'Contrib'      ) {
+	$WIN->AddLabel(                   -name         => 'lblContribCat'                ,
+																		-size         => [ 75, 22]                      ,
+																		-pos          => [140,102]                      ,
+																		-text         => $STR{'Types'}.':'    					,
+																		-font         => $font10                        ,
+																		-background   => [255, 255, 255]                , );
+	$WIN->AddCheckbox(                -name       	=> 'chContribComments'            ,
+																		-size       	=> [105, 20]                      ,
+																		-pos        	=> [220,101]                      ,
+																		-text       	=> $STR{'Comments'}      					,
+																		-background 	=> [255, 255, 255]                ,
+																		-font       	=> $font10                        ,
+																		-tabstop    	=> 1                              ,
+																		-checked    	=> 0                              , );
+	$WIN->AddCheckbox(                -name       	=> 'chContribLikes'               ,
+																		-size       	=> [ 80, 20]                      ,
+																		-pos        	=> [330,101]                      ,
+																		-text       	=> $STR{'Likes'}         					,
+																		-background 	=> [255, 255, 255]                ,
+																		-font       	=> $font10                        ,
+																		-tabstop    	=> 1                              ,
+																		-checked    	=> 0                              , );
+} elsif ($TYPEDUMP eq 'Comments'     ) {
+  $WIN->chProfileIcons->Text("$STR{'Include'} $STR{'Images'}");
+} elsif ($TYPEDUMP eq 'GroupMembers' ) {
+  $WIN->chProfileIcons->Show();
+  $WIN->chAutoScroll->Show();
+}
+
+#------------------------------------------------------------------------------#
+# Splash window
+#------------------------------------------------------------------------------#
+my $splash = new Win32::GUI::Window ( -name       => 'Splash'                  ,
+                                      -text       => 'Splash'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [100,100]                 ,
+                                      -addstyle   => WS_POPUP                  ,
+                                      -popstyle   => WS_CAPTION | WS_THICKFRAME,
+                                      -addexstyle => WS_EX_TOPMOST             , );
+$splash->AddLabel(                    -name       => 'Bitmap'                  ,
+                                      -size       => [128,128]                 ,
+                                      -pos        => [  0,  0]                 ,
+                                      -bitmap     => $WIN_LOGO                 , );
+
+#------------------------------------------------------------------------------#
+# Execute process
+#------------------------------------------------------------------------------#
+&loadConfig;
+if ($TYPEDUMP) {
+  # Center the splash and show it
+  $splash->Center();
+  $splash->Show();
+  Win32::GUI::DoEvents();
+  eval { my $mech = WWW::Mechanize::Chrome->new(tab => 'current'); };
+  if ($@) {
+    my $msgErr = $@;
+    chomp($msgErr);
+    $msgErr =~ s/[\t\r\n]/ /g;
+    &debug($msgErr) if $CONFIG{'DEBUG_LOGGING'};
+    Win32::GUI::MessageBox($WIN, $STR{'errChrome'}, $STR{'Error'}, 0x40010);
+    exit(0);
+  }
+  Win32::GUI::DoEvents();
+  # Hide Splash 
+  $splash->Hide;
+  $THR = threads->create(sub { &loadDumpPageThr($TYPEDUMP); } );
+  if ($CONFIG{'REMEMBER_POS'} and exists($CONFIG{'MAIN_LEFT'}) and exists($CONFIG{'MAIN_TOP'})) {
+    $WIN->Left($CONFIG{'MAIN_LEFT'});
+    $WIN->Top($CONFIG{'MAIN_TOP'});
+  }
+  $WIN->Show();
+  Win32::GUI::Dialog();  
+} else {
+  Win32::GUI::MessageBox($WIN, $STR{'warn1'}, $STR{'Error'}, 0x40010);
+  exit(0);
+}
+
+#--------------------------#
+sub win_Resize
+#--------------------------#
+{
+  my $winTitle = $WIN->Text();
+  $WIN->tfFilename->Width($WIN->ScaleWidth()-283);
+  $WIN->cbFormat->Left($WIN->ScaleWidth()-60);
+  $WIN->tfDirSave->Width($WIN->ScaleWidth()-272);
+  $WIN->btnDirSave->Left($WIN->ScaleWidth()-50);
+  $WIN->btnBrowseDirSave->Left($WIN->ScaleWidth()-27);
+  $WIN->lblInProgress->Left($WIN->ScaleWidth()-233);
+  $WIN->btnRefresh->Left($WIN->ScaleWidth()-27);
+  $WIN->btnDumpNow->Left(($WIN->ScaleWidth()/2)-155);
+  $WIN->btnDumpNow->Top($WIN->ScaleHeight()-37);
+  $WIN->btnAddQueue->Left(($WIN->ScaleWidth()/2)+5);
+  $WIN->btnAddQueue->Top($WIN->ScaleHeight()-37);
+  if ($winTitle eq "$STR{'Dump'} $STR{'Albums'}") { # Resize Dump Friends window
+    $WIN->GridAlbums->Width($WIN->ScaleWidth()-144);
+    $WIN->GridAlbums->Height($WIN->ScaleHeight()-170);
+    $WIN->GridAlbums->AutoSize();
+    $WIN->GridAlbums->ExpandLastColumn();
+    $WIN->lblAlbumsInc->Top($WIN->ScaleHeight()-64);
+    $WIN->chAlbumsIncSmall->Top($WIN->ScaleHeight()-64);
+    $WIN->chAlbumsIncLarge->Top($WIN->ScaleHeight()-64);
+    $WIN->chPublishDate->Top($WIN->ScaleHeight()-64);
+  } elsif ($winTitle eq "$STR{'Dump'} $STR{'Friends'}") { # Resize Dump Friends window
+    $WIN->GridFriends->Width($WIN->ScaleWidth()-146);
+    $WIN->GridFriends->Height($WIN->ScaleHeight()-140);
+    $WIN->GridFriends->AutoSize();
+    $WIN->GridFriends->ExpandLastColumn();
+  } elsif ($winTitle eq "$STR{'Dump'} $STR{'contributors'}") { # Resize Dump Contributors window
+    $WIN->lblPages->Top(129);
+    $WIN->chPageCurr->Top(127);
+    $WIN->chAlbums->Top(127);
+    $WIN->btnAlbumsRefresh->Move($WIN->ScaleWidth()-27, 126);
+    $WIN->GridAlbums->Top(152);
+    $WIN->GridAlbums->Width($WIN->ScaleWidth()-144);
+    $WIN->GridAlbums->Height($WIN->ScaleHeight()-195);
+    $WIN->GridAlbums->AutoSize();
+    $WIN->GridAlbums->ExpandLastColumn();
+  } elsif ($winTitle eq "$STR{'Dump'} $STR{'Comments'}") { # Resize Dump Comments window
+    $WIN->lblPages->Top(102);
+    $WIN->chPageCurr->Top(100);
+    $WIN->chAlbums->Top(100);
+    $WIN->btnAlbumsRefresh->Move($WIN->ScaleWidth()-27, 99);
+    $WIN->GridAlbums->Top(125);
+    $WIN->GridAlbums->Width($WIN->ScaleWidth()-144);
+    $WIN->GridAlbums->Height($WIN->ScaleHeight()-170);
+    $WIN->GridAlbums->AutoSize();
+    $WIN->GridAlbums->ExpandLastColumn();
+  }
+
+}  #--- End win_Resize
+
+#--------------------------#
+sub cbFormat_Change
+#--------------------------#
+{
+  my $selFormat = $WIN->cbFormat->GetCurSel();
+	$CONFIG{uc($TYPEDUMP).'_REPORT_FORMAT'} = $selFormat;
+	&saveConfig();
+  if    ($TYPEDUMP eq 'Albums'       ) { &isDumpAlbumsReady;        }
+  elsif ($TYPEDUMP eq 'Friends'      ) { &isDumpFriendsReady;       }
+  elsif ($TYPEDUMP eq 'MutualFriends') { &isDumpMutualFriendsReady; }
+  elsif ($TYPEDUMP eq 'Contrib'      ) { &isDumpContribReady;       }
+  elsif ($TYPEDUMP eq 'Comments'     ) { &isDumpCommentsReady;      }
+  elsif ($TYPEDUMP eq 'GroupMembers' ) { &isDumpGroupMembersReady;  }
+	return(1);
+
+}  #--- End cbFormat_Change
+
+#--------------------------#
+sub tfDirSave_Change
+#--------------------------#
+{
+  my $saveDir = $WIN->tfDirSave->Text();
+  # Remember
+  if ($saveDir and -d $saveDir and $CONFIG{'REMEMBER_SAVE_DIR'}) {
+		$CONFIG{uc($TYPEDUMP).'_DIR_SAVE'} = $saveDir;
+		&saveConfig();
+  }
+  if    ($TYPEDUMP eq 'Albums'       ) { &isDumpAlbumsReady;        }
+  elsif ($TYPEDUMP eq 'Friends'      ) { &isDumpFriendsReady;       }
+  elsif ($TYPEDUMP eq 'MutualFriends') { &isDumpMutualFriendsReady; }
+  elsif ($TYPEDUMP eq 'Contrib'      ) { &isDumpContribReady;       }
+  elsif ($TYPEDUMP eq 'Comments'     ) { &isDumpCommentsReady;      }
+  elsif ($TYPEDUMP eq 'GroupMembers' ) { &isDumpGroupMembersReady;  }
+	return(1);
+
+}  #--- End tfDirSave_Change
+
+#--------------------------#
+sub tfFilename_Change
+#--------------------------#
+{
+  if    ($TYPEDUMP eq 'Albums'       ) { &isDumpAlbumsReady;        }
+  elsif ($TYPEDUMP eq 'Friends'      ) { &isDumpFriendsReady;       }
+  elsif ($TYPEDUMP eq 'MutualFriends') { &isDumpMutualFriendsReady; }
+  elsif ($TYPEDUMP eq 'Contrib'      ) { &isDumpContribReady;       }
+  elsif ($TYPEDUMP eq 'Comments'     ) { &isDumpCommentsReady;      }
+  elsif ($TYPEDUMP eq 'GroupMembers' ) { &isDumpGroupMembersReady;  }
+
+}  #--- End tfFilename_Change
+
+#--------------------------#
+sub btnDirSave_Click
+#--------------------------#
+{
+  # Local variables
+  my $lastDir = $WIN->tfDirSave->Text();
+  my $dir;
+  # Show dialog window
+  if ($lastDir) {
+    my(@parts) = split(/\\/, $lastDir);
+    if (pop(@parts) =~ /\./) { while ($lastDir =~ /[^\\]$/) { chop($lastDir); } }
+    $dir = Win32::GUI::BrowseForFolder(-owner => $WIN, -title => $STR{'SelectDir'}, -folderonly => 1, -newui => 1, -directory => $lastDir);
+  } else {
+    $dir = Win32::GUI::BrowseForFolder(-owner => $WIN, -title => $STR{'SelectDir'}, -folderonly => 1, -newui => 1);
+  }
+  # Selected folder
+  if ($dir and -d $dir) {
+    chop($dir) if $dir =~ /\\$/;
+    $WIN->tfDirSave->Text($dir);
+  }
+	return(1);
+  
+}  #--- End btnDirSave_Click
+
+#--------------------------#
+sub btnBrowseDirSave_Click { &exploreDir($WIN->tfDirSave->Text()); }
+#--------------------------#
+
+#--------------------------#
+sub chProfileIcons_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($WIN->chProfileIcons->Checked()) {
+    $CONFIG{'INCLUDE_ICONS'} = 1;
+    &saveConfig();
+  # Don't save
+  } else {
+    $CONFIG{'INCLUDE_ICONS'} = 0;
+    &saveConfig();
+  }
+
+}  #--- End chProfileIcons_Click
+
+#--------------------------#
+sub chAutoScroll_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($WIN->chAutoScroll->Checked()) {
+    $CONFIG{'AUTOSCROLL'} = 1;
+    &saveConfig();
+  # Don't save
+  } else {
+    $CONFIG{'AUTOSCROLL'} = 0;
+    &saveConfig();
+  }
+
+}  #--- End chAutoScroll_Click
+
+#--------------------------#
+sub btnRefresh_Click
+#--------------------------#
+{
+  # Avoid new thread
+  if ($THR and $THR->is_running()) { Win32::GUI::MessageBox($WIN, $STR{'processRunning'},$STR{'Warning'},0x40010); }
+	else { $THR = threads->create(sub { &loadDumpPageThr($TYPEDUMP); }); }
+  
+}  #--- End btnRefresh_Click
+
+#--------------------------#
+sub win_Terminate
+#--------------------------#
+{
+	&rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+  -1; # Exit signal
+
+}  #--- End winFriends_Terminate
+
+#--------------------------#
+sub chAlbumsIncSmall_Click	{ &isDumpAlbumsReady(); }
+sub chAlbumsIncLarge_Click	{ &isDumpAlbumsReady(); }
+#--------------------------#
+
+#--------------------------#
+sub GridAlbums_Click
+#--------------------------#
+{
+  # Local variables
+  my ($row, $column) = @_;
+  # Select
+  if (!$column) {
+    my $selStatus = $WIN->GridAlbums->GetCellCheck($row, $column);
+    if (!$row) {
+      if (!$selStatus) { # Check all
+				for (my $i = 0; $i < $WIN->GridAlbums->GetRows(); $i++) { $WIN->GridAlbums->SetCellCheck($i, 0, 1); }
+			} else { # Uncheck all
+				for (my $i = 0; $i < $WIN->GridAlbums->GetRows(); $i++) { $WIN->GridAlbums->SetCellCheck($i, 0, 0); }
+			}
+    } else {
+      if (!$selStatus) { $WIN->GridAlbums->SetCellCheck($row, $column, 1); } # Check
+      else             { $WIN->GridAlbums->SetCellCheck($row, $column, 0); } # Uncheck
+    }
+  }
+  if    ($TYPEDUMP eq 'Albums'  ) { &isDumpAlbumsReady();   }
+  elsif ($TYPEDUMP eq 'Contrib' ) { &isDumpContribReady();  }
+  elsif ($TYPEDUMP eq 'Comments') { &isDumpCommentsReady(); }
+  return(1);
+
+}  #--- End GridAlbums_Click
+
+#--------------------------#
+sub chAlbumsOpenDir_Click
+#--------------------------#
+{
+  # Save the choice
+  if ($WIN->chAlbumsOpenDir->Checked()) {
+    $CONFIG{'ALBUMS_OPEN_DIR'} = 1;
+    &saveConfig();
+  # Don't save
+  } else {
+    $CONFIG{'ALBUMS_OPEN_DIR'} = 0;
+    &saveConfig();
+  }
+	return(1);
+
+}  #--- End chAlbumsOpenDir_Click
+
+#--------------------------#
+sub isDumpAlbumsReady
+#--------------------------#
+{
+  # Local variables
+  my $saveDir = $WIN->tfDirSave->Text();
+  # No album title, no profile type or no valid directory
+  if (!$WIN->tfFilename->Text() or !$WIN->tfPageType->Text() or !$saveDir or !-d $saveDir) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  # Selected report format
+	my $selFormat = $WIN->cbFormat->GetCurSel();
+	if ($selFormat == 1) {
+		$WIN->chAlbumsIncSmall->Enable();
+		$WIN->chAlbumsIncLarge->Enable();
+	} else {
+		$WIN->chAlbumsIncSmall->Disable();
+		$WIN->chAlbumsIncLarge->Disable();
+		$WIN->chAlbumsIncSmall->Checked(0);
+		$WIN->chAlbumsIncLarge->Checked(0);
+	}
+  # Albums name loaded and at least one checked ?
+  my $albumPicsChecked  = 0;
+  my $albumVideoChecked = 0;
+  for (my $i = 1; $i < $WIN->GridAlbums->GetRows(); $i++) {
+    if ($WIN->GridAlbums->GetCellCheck($i, 0)) {
+      $albumPicsChecked = 1;
+      last if $albumPicsChecked and $albumVideoChecked;
+    }
+  }
+  # Pic album selected
+  if ($albumPicsChecked and $selFormat == 1) { $WIN->chAlbumsIncLarge->Enable(); }
+  else {
+    $WIN->chAlbumsIncLarge->Checked(0);
+    $WIN->chAlbumsIncLarge->Disable();
+  }
+  # No selected albums
+  if (!$albumPicsChecked and !$albumVideoChecked) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();
+
+}  #--- End isDumpAlbumsReady
+
+#--------------------------#
+sub GridFriends_Click
+#--------------------------#
+{
+  # Local variables
+  my ($row, $column) = @_;
+  # Select
+  if (!$column) {
+    my $selStatus = $WIN->GridFriends->GetCellCheck($row, $column);
+    if (!$row) {
+      # Check all
+      if (!$selStatus) {
+				for (my $i = 0; $i < $WIN->GridFriends->GetRows(); $i++) { $WIN->GridFriends->SetCellCheck($i, 0, 1); }
+      # Uncheck all
+			} else {
+				for (my $i = 0; $i < $WIN->GridFriends->GetRows(); $i++) { $WIN->GridFriends->SetCellCheck($i, 0, 0); }
+			}
+    } else {
+      if (!$selStatus) { $WIN->GridFriends->SetCellCheck($row, $column, 1); } # Check
+      else             { $WIN->GridFriends->SetCellCheck($row, $column, 0); } # Uncheck
+    }
+  }
+	&isDumpFriendsReady();
+  return(1);
+
+}  #--- End GridFriends_Click
+
+#--------------------------#
+sub isDumpFriendsReady
+#--------------------------#
+{
+  # Local variables
+  my $saveDir       = $WIN->tfDirSave->Text();
+  my $friendName    = $WIN->tfFilename->Text();
+  # Valid directory and valid name for save ?
+  if (!$saveDir or !-d $saveDir or !$friendName) { $WIN->btnDumpNow->Disable(); return(0); }
+  # Friends category loaded and at least one checked ?
+  my $friendsChecked = 0;
+  for (my $i = 1; $i < $WIN->GridFriends->GetRows(); $i++) {
+    if ($WIN->GridFriends->GetCellCheck($i, 0)) {
+      $friendsChecked = 1;
+      last;
+    }
+  }
+  if (!$friendsChecked) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();
+
+}  #--- End isDumpFriendsReady
+
+#--------------------------#
+sub isDumpMutualFriendsReady
+#--------------------------#
+{
+  # Local variables
+  my $mutualFriendsName   = $WIN->tfFilename->Text();
+  my $saveDir             = $WIN->tfDirSave->Text();
+  # Valid directory and valid name for save ?
+  if (!$saveDir or !-d $saveDir or !$mutualFriendsName) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();
+
+}  #--- End isDumpMutualFriendsReady
+
+#--------------------------#
+sub chContribComments_Click 	{ &isDumpContribReady(); }
+sub chContribLikes_Click    	{ &isDumpContribReady(); }
+#--------------------------#
+
+#--------------------------#
+sub chPageCurr_Click
+#--------------------------#
+{
+  if    ($TYPEDUMP eq 'Contrib' ) { &isDumpContribReady();  }
+  elsif ($TYPEDUMP eq 'Comments') { &isDumpCommentsReady(); }
+
+}  #--- End chPageCurr_Click
+
+#--------------------------#
+sub chAlbums_Click
+#--------------------------#
+{
+  if ($WIN->chAlbums->Checked()) {
+		$WIN->GridAlbums->Enable();
+		$WIN->btnAlbumsRefresh->Enable();
+		&btnAlbumsRefresh_Click();
+		$WIN->chAutoScroll->Checked(1);
+	} else {
+		$WIN->GridAlbums->Disable();
+		$WIN->btnAlbumsRefresh->Disable();
+	}
+  if    ($TYPEDUMP eq 'Contrib' ) { &isDumpContribReady();  }
+  elsif ($TYPEDUMP eq 'Comments') { &isDumpCommentsReady(); }
+
+}  #--- End chAlbums_Click
+
+#--------------------------#
+sub btnAlbumsRefresh_Click
+#--------------------------#
+{
+  # Avoid new thread
+  if ($THR and $THR->is_running()) { Win32::GUI::MessageBox($WIN, $STR{'processRunning'},$STR{'Warning'},0x40010); }
+	else {
+		$WIN->lblInProgress->Text($STR{'loadAlbum'}.'...');
+    $WIN->GridAlbums->DeleteNonFixedRows();
+    $WIN->GridAlbums->Refresh();
+    my $typeDump;
+    if    ($TYPEDUMP eq 'Contrib' ) { $typeDump = 'ContribAlbums';  }
+    elsif ($TYPEDUMP eq 'Comments') { $typeDump = 'CommentsAlbums'; }
+    $THR = threads->create(sub { &loadDumpPageThr($typeDump); } );
+  }
+  
+}  #--- End btnAlbumsRefresh_Click
+
+#--------------------------#
+sub isDumpContribReady
+#--------------------------#
+{
+  # Local variables
+  my $contribName   = $WIN->tfFilename->Text();
+  my $saveDir       = $WIN->tfDirSave->Text();
+  # Valid directory and valid name for save ?
+  if (!$saveDir or !-d $saveDir or !$contribName) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  # At least one type checked
+  if (!$WIN->chContribComments->Checked() and !$WIN->chContribLikes->Checked()) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  # At least one page item checked (current page or Picture pages)
+  if (!$WIN->chPageCurr->Checked()) {
+    my $nbrAlbumCheck = 0;
+    if ($WIN->chAlbums->Checked()) {
+      for (my $i = 1; $i < $WIN->GridAlbums->GetRows(); $i++) {
+        if ($WIN->GridAlbums->GetCellCheck($i, 0)) {
+          $nbrAlbumCheck++;
+          last;
+        }
+      }
+    }
+    # If only Picture pages is checked, at least one album must be checked
+    if (!$WIN->chAlbums->Checked() or !$nbrAlbumCheck) {
+      $WIN->btnDumpNow->Disable();
+      $WIN->btnAddQueue->Disable();
+      return(0);
+    }
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();
+
+}  #--- End isDumpContribReady
+
+#--------------------------#
+sub isDumpCommentsReady
+#--------------------------#
+{
+  # Local variables
+  my $commentsName   = $WIN->tfFilename->Text();
+  my $saveDir        = $WIN->tfDirSave->Text();
+  # Valid directory and valid name for save ?
+  if (!$saveDir or !-d $saveDir or !$commentsName) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    return(0);
+  }
+  # At least one page item checked (current page or Picture pages)
+  if (!$WIN->chPageCurr->Checked()) {
+    my $nbrAlbumCheck = 0;
+    if ($WIN->chAlbums->Checked()) {
+      for (my $i = 1; $i < $WIN->GridAlbums->GetRows(); $i++) {
+        if ($WIN->GridAlbums->GetCellCheck($i, 0)) {
+          $nbrAlbumCheck++;
+          last;
+        }
+      }
+    }
+    # If only Picture pages is checked, at least one album must be checked
+    if (!$WIN->chAlbums->Checked() or !$nbrAlbumCheck) {
+      $WIN->btnDumpNow->Disable();
+      $WIN->btnAddQueue->Disable();
+      return(0);
+    }
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();
+
+}  #--- End isDumpCommentsReady
+
+#--------------------------#
+sub isDumpGroupMembersReady
+#--------------------------#
+{
+  # Local variables
+  my $GroupMembersName   = $WIN->tfFilename->Text();
+  my $saveDir            = $WIN->tfDirSave->Text();
+  # Valid directory and valid name for save ?
+  if (!$saveDir or !-d $saveDir or !$GroupMembersName) {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();  
+    return(0);
+  }
+  $WIN->btnDumpNow->Enable();
+  $WIN->btnAddQueue->Enable();  
+
+}  #--- End isDumpGroupMembersReady
+
+#--------------------------#
+sub getCurrPidCode
+#--------------------------#
+{
+  # Local variables
+  my $refMech = shift;
+  my $pidCode = undef;
+  # Second return value (pageType): 0 = unknown, 1 = People, 2 = Groups, 3 = Pages (Business), 4 = In Messenger, 5 = Event page, 6 = Mutual Friends
+	# Normal profile
+	if ($pidCode = $$refMech->selector('div._4a8n a', any => 1)) {
+		if ($pidCode->{outerHTML} =~ /user.php\?id=(\d+)/) { return($1, 1); }
+	} elsif ($pidCode = $$refMech->selector('a.profilePicThumb', any => 1)) {
+		if ($pidCode->{attributes}->{href} =~ /profile_id=(\d+)/ or $pidCode->{attributes}->{href} =~ /fbid=(\d+)/) { return($1, 1); }
+	# Group profile
+	} elsif ($pidCode = $$refMech->selector('a.coverImage', any => 1)) {
+		if ($pidCode->{outerHTML} =~ /referrer_profile_id=(\d+)/) { return($1, 2); }
+	# Business page
+	} elsif ($pidCode = $$refMech->selector('a._2dgj', any => 1)) {
+		if ($pidCode->{attributes}->{href} =~ /\/([^\/]+)\/photos/) { return($1, 3); }
+  # In Messenger
+  } elsif ($$refMech->uri =~ /\/messages/) {
+    my $currURL = $$refMech->uri;
+    if ($currURL =~ /facebook.com\/messages\/t\/search\/([^\/\?]+)\/?/ or
+        $currURL =~ /facebook.com\/messages\/t\/([^\/\?]+)\/?/         or
+        $currURL =~ /facebook.com\/messages\/archived\/t\/([^\/\?]+)\/?/) {
+      $pidCode = $1;
+    }
+    return($pidCode, 4);
+  # Event page
+  } elsif ($$refMech->uri =~ /\/events((?:\/\d+))?/) {
+    if ($1 and $1 =~ /\/(\d+)/) { $pidCode = $1; }
+    return($pidCode, 5);
+  # Mutual Friends
+  } elsif ($$refMech->uri =~ /\/mutual_friends/) {
+    if ($$refMech->uri =~ /uid=(\d+)&node=(\d+)/) {
+      $pidCode = "$1 - $2";
+    }
+    return($pidCode, 6);
+  }
+  return(0, 0);
+  
+}  #--- End getCurrPidCode
+
+#--------------------------#
+sub loadDumpPageThr
+#--------------------------#
+{
+  my $typeDump = shift;
+  # Deal with crash
+  $SIG{__DIE__} = sub {
+    my $msgErr = $_[0];
+    # Ignore some errors
+    return if ($msgErr =~ /Future\/HTTP\/Tiny\/threaded\.pm/ or $msgErr =~ /\&Errno\:\:(?:EBADMSG|EPROTO)/ or $msgErr =~ /does not map to iso-8859-1/ or
+               $msgErr =~ /content must be bytes at/ or $msgErr =~ /No node with given id found/);
+    chomp($msgErr);
+    $msgErr =~ s/[\t\r\n]/ /g;
+    &debug($msgErr) if $CONFIG{'DEBUG_LOGGING'};
+    my $err = (split(/ at /, $msgErr))[0];
+    $WIN->ChangeCursor($ARROW);
+    Win32::GUI::MessageBox($WIN, "$STR{'processCrash'}: $err", $STR{'Error'}, 0x40010);
+    threads->exit();
+  };
+  # Reset controls
+  $WIN->tfFilename->Text('') if $typeDump ne 'ContribAlbums' and $typeDump ne 'CommentsAlbums';
+  if    ($typeDump eq 'Albums'  ) { $WIN->GridAlbums->DeleteNonFixedRows();  $WIN->GridAlbums->Refresh();  }
+  elsif ($typeDump eq 'Friends' ) { $WIN->GridFriends->DeleteNonFixedRows(); $WIN->GridFriends->Refresh(); }
+  elsif ($typeDump eq 'Contrib' or $typeDump eq 'Comments') { $WIN->tfProfilID->Text(''); $WIN->tfStartURL->Text(''); }
+  my $mech;
+  eval { $mech = WWW::Mechanize::Chrome->new(tab => 'current'); };
+  if ($@) {
+    Win32::GUI::MessageBox($WIN, $STR{'errMozRepl'}, $STR{'Error'}, 0x40010) if $@ =~ /Failed to connect to/;
+    threads->exit();
+  }
+  # Valid current page
+  if ($mech->uri() =~ /facebook.com/) {
+    $WIN->ChangeCursor($HOURGLASS);
+    if    ($typeDump eq 'Albums'        ) { &loadDumpAlbum(        \$mech); }
+    elsif ($typeDump eq 'Friends'       ) { &loadDumpFriends(      \$mech); }
+    elsif ($typeDump eq 'MutualFriends' ) { &loadDumpMutualFriends(\$mech); }
+    elsif ($typeDump eq 'Contrib'       ) { &loadDumpContrib(      \$mech); }
+    elsif ($typeDump eq 'ContribAlbums' ) { &loadDumpContribAlbum( \$mech); }
+    elsif ($typeDump eq 'Comments'      ) { &loadDumpComments(     \$mech); }
+    elsif ($typeDump eq 'CommentsAlbums') { &loadDumpContribAlbum( \$mech); }
+    elsif ($typeDump eq 'GroupMembers'  ) { &loadDumpGroupMembers( \$mech); }
+    $WIN->lblInProgress->Text('');
+    $WIN->ChangeCursor($ARROW);
+  } else { Win32::GUI::MessageBox($WIN, $STR{'warn4'}, $STR{'Error'}, 0x40010); }
+  if    ($typeDump eq 'Albums'        ) { &isDumpAlbumsReady();        }
+  elsif ($typeDump eq 'Friends'       ) { &isDumpFriendsReady();       }
+  elsif ($typeDump eq 'MutualFriends' ) { &isDumpMutualFriendsReady(); }
+  elsif ($typeDump eq 'Contrib'       ) { &isDumpContribReady();       }
+  elsif ($typeDump eq 'ContribAlbums' ) { &isDumpContribReady();       }
+  elsif ($typeDump eq 'Comments'      ) { &isDumpCommentsReady();      }
+  elsif ($typeDump eq 'CommentsAlbums') { &isDumpCommentsReady();      }
+  elsif ($typeDump eq 'GroupMembers'  ) { &isDumpGroupMembersReady();  }
+  
+}  #--- End loadDumpPageThr
+  
+#--------------------------#
+sub loadDumpAlbum
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  # Valid current page
+	$WIN->lblInProgress->Text($STR{'loadAlbum'}.'...');
+  my ($validPage, $currURL) = &validAlbumPage($refMech, 1, 1);
+  if ($validPage) {
+    # Get album names and urls
+    my %albums;
+    my $pageType = $WIN->tfPageType->Text();
+    if    ($pageType == 1 or $pageType == 2) { # People or Group
+      &getListAlbums($refMech, \$WIN->GridAlbums, $pageType);
+      if ($pageType == 2) { # For group, albums may be on multiple pages
+        my $nextAlbumPage = $$refMech->selector('a.next', any => 1);
+        if (!$nextAlbumPage->{attributes}{'aria-disabled'} or $nextAlbumPage->{attributes}{'aria-disabled'} ne 'true') {
+          while ($nextAlbumPage) {
+            $$refMech->eval_in_page("var button = (document.getElementsByClassName('next'))[0]; if (button) { button.click(); }");
+            sleep($CONFIG{'TIME_TO_WAIT'});
+            $nextAlbumPage = $$refMech->selector('a.next', any => 1);
+            &getListAlbums($refMech, \$WIN->GridAlbums, $pageType);
+            if ($nextAlbumPage->{attributes}{'aria-disabled'} and $nextAlbumPage->{attributes}{'aria-disabled'} eq 'true') { last; }
+          }
+        }
+      }
+    } elsif ($pageType == 3) { # Page (Business)
+      &getListAlbums($refMech, \$WIN->GridAlbums, $pageType);
+    }
+    $WIN->tfCurrURL->Text($currURL);
+    if ($WIN->GridAlbums->GetRows() > 1) {
+      # Feed the Album Grid
+      $WIN->GridAlbums->SetCellCheck(0, 0, 1);
+      $WIN->GridAlbums->Refresh();
+      $WIN->GridAlbums->AutoSize();
+      $WIN->GridAlbums->ExpandLastColumn();
+      $WIN->GridAlbums->BringWindowToTop();
+    } else { Win32::GUI::MessageBox($WIN, $STR{'loadAlbumFail'}, $STR{'Error'}, 0x40010); }
+  } else {
+		Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Error'}, 0x40010);
+		undef $$refMech;
+	}
+
+}  #--- End loadDumpAlbum
+
+#--------------------------#
+sub loadDumpFriends
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  # Valid current page
+  $WIN->lblInProgress->Text($STR{'gatherFriendsLists'}.'...');
+  my $currURL = $$refMech->uri();
+  chop($currURL) if $currURL =~ /#$/;
+  my $currTitle;
+  if ($currURL !~ /\/friends\/?/ and $currURL !~ /sk=friends/) {
+    if ($CONFIG{'AUTO_LOAD_SCROLL'}) {
+      # Trying to get the good page
+      if ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/) {
+        my $profilID = $1;
+        my $goodURL = "https://www.facebook.com/profile.php?id=$profilID&sk=friends";
+        ($currURL, $currTitle) = &loadPage($refMech, $goodURL, $CONFIG{'TIME_TO_WAIT'});
+      } elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/) {
+        my $goodURL = "https://www.facebook.com/$1/friends";
+        ($currURL, $currTitle) = &loadPage($refMech, $goodURL, $CONFIG{'TIME_TO_WAIT'});
+      }
+      # Re evaluate current page
+      if (($currURL !~ /\/friends\/?$/ and $currURL !~ /sk=friends/) or $currTitle =~ /Page Not Found/) {
+        Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Warning'}, 0x40010);
+      } else {
+        if    ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/) { $currTitle = $1; }
+        elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/                ) { $currTitle = $1; }
+        $currTitle =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g;
+        $WIN->tfFilename->Text("$currTitle - $STR{'Friends'}");
+      }
+    } else { Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Error'}, 0x40010); }
+  # You are in the right page
+  } else {
+    if    ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/) { $currTitle = $1; }
+    elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/                ) { $currTitle = $1; }
+    $currTitle =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g;
+    $WIN->tfFilename->Text("$currTitle - $STR{'Friends'}");
+  }
+  # List available categories
+  if ($WIN->tfFilename->Text()) {
+		sleep($CONFIG{'TIME_TO_WAIT'});
+    $WIN->tfCurrURL->Text($currURL);
+    my %categories;
+    if (my @links = $$refMech->selector('div#pagelet_timeline_medley_friends a._3c_')) {
+      foreach my $link (@links) {
+        if (my $url	 = $link->{attributes}->{href} and my $name = $link->{attributes}->{name}) {
+          $url =~ s/&amp;/&/g;
+          $url =~ s/sk=wall&//g;
+          my $cat = encode($CONFIG{'CHARSET'}, $name);
+          $cat =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g;
+          $categories{$cat}{name} = $name;
+          $categories{$cat}{url}  = $url;
+          if ($link->{attributes}->{'aria-controls'} =~ /\:([^\:]+)$/) {
+            my $catId = $1;
+            $categories{$cat}{catId} = $catId;
+          }
+        }
+      }
+      foreach my $cat (sort keys %categories) {
+        if ($categories{$cat} and my $i = $WIN->GridFriends->InsertRow($cat, -1)) {
+          $WIN->GridFriends->SetCellText($i, 0, ''        );
+          $WIN->GridFriends->SetCellType($i, 0, GVIT_CHECK);
+          $WIN->GridFriends->SetCellCheck($i, 0, 1);
+          $WIN->GridFriends->SetCellText($i, 1, $cat                    );
+          $WIN->GridFriends->SetCellText($i, 2, $categories{$cat}{catId});
+          $WIN->GridFriends->SetCellText($i, 3, $categories{$cat}{url}  );
+        }
+      }
+      $WIN->GridFriends->AutoSize();
+      $WIN->GridFriends->ExpandLastColumn();
+      $WIN->GridFriends->Refresh();
+      $WIN->GridFriends->BringWindowToTop();
+    } else { Win32::GUI::MessageBox($WIN, "$STR{'Error'} $STR{'gatherFriendsLists'}", $STR{'Error'}, 0x40010); }
+  }
+
+}  #--- End loadDumpFriends
+
+#--------------------------#
+sub loadDumpMutualFriends
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  my $currURL = $$refMech->uri();
+  if ($currURL =~ /uid=(\d+)&node=(\d+)/) {
+    my $id1 = $1;
+    my $id2 = $2;
+    $WIN->tfFilename->Text("$id1 - $id2 - $STR{'MutualFriends'}");
+    $WIN->tfCurrURL->Text($$refMech->uri);
+  } else {
+    $WIN->btnDumpNow->Disable();
+    $WIN->btnAddQueue->Disable();
+    Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Warning'}, 0x40010);
+  }
+
+}  #--- End loadDumpMutualFriends
+
+#--------------------------#
+sub loadDumpContrib
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  my $title;
+  my $currURL = $$refMech->uri();
+  my ($pidCode, $pageType) = &getCurrPidCode($refMech);
+  if    ($pidCode) { $title = $pidCode; $WIN->tfProfilID->Text($pidCode); }
+  elsif ($currURL =~ /profile.php\?id=([^\/\&\#]+)/                  ) { $title = $1; }
+  elsif ($currURL =~ /fbid=([^\/\&\#]+)/                             ) { $title = $1; }
+  elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/) { $title = $1; }
+  $WIN->tfFilename->Text("$title - $STR{'contributors'}");
+  $WIN->tfStartURL->Text($currURL);
+  if (my ($pidCode, $pageType) = &getCurrPidCode($refMech)) { $WIN->tfProfilID->Text($pidCode); }
+  # pageType: 0 = unknown, 1 = People, 2 = Groups, 3 = Pages (Business), 4 = In Messenger, 5 = Event page, 6 = Mutual Friends
+  if ($pageType == 1) { $WIN->chAlbums->Enable();  } # People profile
+  else                { $WIN->chAlbums->Disable(); }
+
+}  #--- End loadDumpContrib
+
+#--------------------------#
+sub loadDumpContribAlbum
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  # Valid current page
+  my ($validPage, $currURL) = &validAlbumPage($refMech, 2, 0);
+  if ($validPage) {
+    # Get album names and urls
+    my %albums;
+    &getListAlbums($refMech, \$WIN->GridAlbums, 1);
+    if ($WIN->GridAlbums->GetRows() > 1) {
+      # Feed the Album Grid
+      $WIN->GridAlbums->SetCellCheck(0, 0, 1);
+      $WIN->GridAlbums->Refresh();
+      $WIN->GridAlbums->AutoSize();
+      $WIN->GridAlbums->ExpandLastColumn();
+      $WIN->GridAlbums->BringWindowToTop();
+    } else { Win32::GUI::MessageBox($WIN, $STR{'loadAlbumFail'}, $STR{'Error'}, 0x40010); }
+  } else { Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Error'}, 0x40010); }
+
+}  #--- End loadDumpContribAlbum
+
+#--------------------------#
+sub loadDumpComments
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  my $title;
+  my $currURL = $$refMech->uri();
+  my ($pidCode, $pageType) = &getCurrPidCode($refMech);
+  if    ($pidCode) { $title = $pidCode; $WIN->tfProfilID->Text($pidCode); }
+  elsif ($currURL =~ /profile.php\?id=([^\/\&\#]+)/                  ) { $title = $1; }
+  elsif ($currURL =~ /fbid=([^\/\&\#]+)/                             ) { $title = $1; }
+  elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/) { $title = $1; }
+  $WIN->tfFilename->Text("$title - $STR{'Comments'}");
+  $WIN->tfStartURL->Text($currURL);
+  if (my ($pidCode, $pageType) = &getCurrPidCode($refMech)) { $WIN->tfProfilID->Text($pidCode); }
+  # pageType: 0 = unknown, 1 = People, 2 = Groups, 3 = Pages (Business), 4 = In Messenger, 5 = Event page, 6 = Mutual Friends
+  if ($pageType == 1) { $WIN->chAlbums->Enable();  } # People profile
+  else                { $WIN->chAlbums->Disable(); }
+
+}  #--- End loadDumpComments
+
+#--------------------------#
+sub loadDumpGroupMembers
+#--------------------------#
+{
+  # Local variables
+  my ($refMech) = @_;
+  my $saveDir = $WIN->tfDirSave->Text();
+  $WIN->tfDirSave->Text('') if $saveDir and !-d $saveDir;
+  my $currURL = $$refMech->uri();
+  my $idGroup;
+  my $newURL;
+  # Valid current page
+  if ($currURL =~ /https:\/\/(?:www|web).facebook.com\/groups\/(\w+)\/members/) { # Already in the page
+    $idGroup = $1;
+    $newURL  = $currURL;
+  } elsif ($currURL =~ /(https:\/\/(?:www|web).facebook.com\/groups\/(\w+))/) { # Get the right page
+    my $currUrlPath = $1;
+    $idGroup        = $2;
+    $currURL        = $currUrlPath. "/members";
+    if ($currURL and $CONFIG{'AUTO_LOAD_SCROLL'}) {
+      $$refMech->get($currURL);
+      sleep($CONFIG{'TIME_TO_WAIT'});
+      $newURL = sprintf($$refMech->uri());
+    }
+  }
+  # Right page, get the values
+  if ($newURL and $idGroup and $newURL =~ /https:\/\/(?:www|web).facebook.com\/groups\/$idGroup\/members\/?/) {
+    $WIN->tfFilename->Text("$idGroup - $STR{'groupMembers'}");
+    $WIN->tfCurrURL->Text($newURL);
+  } else { Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Warning'}, 0x40010); }
+
+}  #--- End loadDumpGroupMembers
+
+#--------------------------#
+sub btnDumpNow_Click
+#--------------------------#
+{
+  if    ($TYPEDUMP eq 'Albums'       ) { &dumpAlbums(1);        }
+  elsif ($TYPEDUMP eq 'Friends'      ) { &dumpFriends(1);       }
+  elsif ($TYPEDUMP eq 'MutualFriends') { &dumpMutualFriends(1); }
+  elsif ($TYPEDUMP eq 'Contrib'      ) { &dumpContrib(1);       }
+  elsif ($TYPEDUMP eq 'Comments'     ) { &dumpComments(1);      }
+  elsif ($TYPEDUMP eq 'GroupMembers' ) { &dumpGroupMembers(1);  }	
+	
+}  #--- End btnAlbumsDumpNow_Click
+
+#--------------------------#
+sub btnAddQueue_Click
+#--------------------------#
+{
+  if    ($TYPEDUMP eq 'Albums'       ) { &dumpAlbums(0);        }
+  elsif ($TYPEDUMP eq 'Friends'      ) { &dumpFriends(0);       }
+  elsif ($TYPEDUMP eq 'MutualFriends') { &dumpMutualFriends(0); }
+  elsif ($TYPEDUMP eq 'Contrib'      ) { &dumpContrib(0);       }
+  elsif ($TYPEDUMP eq 'Comments'     ) { &dumpComments(0);      }
+  elsif ($TYPEDUMP eq 'GroupMembers' ) { &dumpGroupMembers(0);  }
+	
+}  #--- End btnAlbumsAddQueue_Click
+
+#--------------------------#
+sub dumpAlbums
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+	&rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpAlbums';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}        = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}   	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+	$dumpParams{startingURL}	  = $WIN->tfCurrURL->Text();
+	# Gather selected album names and urls
+  my %albums;
+	&getSelAlbums(\%albums);
+	$dumpParams{pageType}				= $WIN->tfPageType->Text(); # Page type: 0=unknown, 1=People, 2=Groups, 3=Pages (Business)
+	$dumpParams{openAlbumDir}		= $WIN->chAlbumsOpenDir->Checked();
+	$dumpParams{incPublishDate} = $WIN->chPublishDate->Checked();
+	$dumpParams{incSmallPics}		= $WIN->chAlbumsIncSmall->Checked();
+	$dumpParams{incLargePics}		= $WIN->chAlbumsIncLarge->Checked();
+	$dumpParams{reportFormat}   = $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+  $dumpParams{command}        = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+  mkdir("$USERDIR\\Queue")    if !-d "$USERDIR\\Queue";
+	if (&createDumpDB(  "$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams) and
+      &createAlbumsDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%albums    )) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+
+}  #--- End dumpAlbums
+
+#--------------------------#
+sub dumpFriends
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+	&rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpFriends';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}        = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}   	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+  $dumpParams{startingURL}	  = $WIN->tfCurrURL->Text();
+	# Gather selected friend categories names and urls
+	for (my $i = 1; $i < $WIN->GridFriends->GetRows(); $i++) {
+		if ($WIN->GridFriends->GetCellCheck($i, 0)) {
+			my $catName = $WIN->GridFriends->GetCellText($i, 1);
+			my $catid   = $WIN->GridFriends->GetCellText($i, 2);
+			my $catURL  = $WIN->GridFriends->GetCellText($i, 3);
+      $dumpParams{listCat}       .= $catName . '|';
+			$dumpParams{"$catName-id"}  = $catid;
+			$dumpParams{"$catName-url"} = $catURL;
+		}
+	}
+  chop($dumpParams{listCat});
+	$dumpParams{incIcons}			= $WIN->chProfileIcons->Checked();
+	$dumpParams{reportFormat}	= $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+  $dumpParams{command}      = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+  mkdir("$USERDIR\\Queue")  if !-d "$USERDIR\\Queue";
+	if (&createDumpDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams)) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+  
+}  #--- End dumpFriends
+
+#--------------------------#
+sub dumpMutualFriends
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+	&rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpMutualFriends';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}    	  = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}  	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+	$dumpParams{startingURL}	  = $WIN->tfCurrURL->Text();
+	$dumpParams{incIcons}			  = 1 if $WIN->chProfileIcons->Checked();
+	$dumpParams{autoScroll}     = 1 if $WIN->chAutoScroll->Checked();
+	$dumpParams{reportFormat}   = $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+  $dumpParams{command}        = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+  mkdir("$USERDIR\\Queue")    if !-d "$USERDIR\\Queue";
+	if (&createDumpDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams)) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+
+}  #--- End dumpMutualFriends
+
+#--------------------------#
+sub dumpContrib
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+  &rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpContrib';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}        = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}   	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+  $dumpParams{startingURL}	  = $WIN->tfStartURL->Text() if $WIN->chPageCurr->Checked();
+  $dumpParams{startingID}     = $WIN->tfProfilID->Text() if $WIN->tfProfilID->Text();
+	# Gather selected album names and urls
+  my %albums;
+  if ($WIN->chAlbums->Checked()) {
+    &getSelAlbums(\%albums);
+    $dumpParams{pageType}   = 1; # Page type: 1=People
+  }
+  $dumpParams{reportFormat} = $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+	$dumpParams{incIcons}			= 1 if $WIN->chProfileIcons->Checked();
+	$dumpParams{comments}			= 1 if $WIN->chContribComments->Checked();
+	$dumpParams{likes}				= 1 if $WIN->chContribLikes->Checked();
+	$dumpParams{autoScroll}   = 1 if $WIN->chAutoScroll->Checked();
+  $dumpParams{command}      = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+	# Create database
+  mkdir("$USERDIR\\Queue") if !-d "$USERDIR\\Queue";
+	if (&createDumpDB(  "$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams ) and
+      &createAlbumsDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%albums     )) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+	
+}  #--- End dumpContrib
+
+#--------------------------#
+sub dumpComments
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+  &rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpComments';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}        = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}   	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+  $dumpParams{startingURL}	  = $WIN->tfStartURL->Text() if $WIN->chPageCurr->Checked();
+  $dumpParams{startingID}     = $WIN->tfProfilID->Text() if $WIN->tfProfilID->Text();
+	# Gather selected album names and urls
+  my %albums;
+  if ($WIN->chAlbums->Checked()) { &getSelAlbums(\%albums); $dumpParams{pageType} = 1; }
+  $dumpParams{reportFormat} = $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+	$dumpParams{incIcons}			= 1 if $WIN->chProfileIcons->Checked();
+	$dumpParams{autoScroll}   = 1 if $WIN->chAutoScroll->Checked();
+  $dumpParams{command}      = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+	# Create database
+  mkdir("$USERDIR\\Queue") if !-d "$USERDIR\\Queue";
+	if (&createDumpDB(  "$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams ) and
+      &createAlbumsDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%albums     )) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+	
+}  #--- End dumpComments
+
+#--------------------------#
+sub dumpGroupMembers
+#--------------------------#
+{
+  # Local variables
+  my ($now) = @_;
+  &rememberPosWin() if $CONFIG{'REMEMBER_POS'};
+	# Get Dump parameters
+	my %dumpParams;
+	$dumpParams{procID}				  = time;
+	$dumpParams{processName}	  = 'DumpGroupMembers';
+  $dumpParams{now}	          = $now;
+	$dumpParams{charSet}        = $CONFIG{'CHARSET'};
+	$dumpParams{filename} 	    = encode($dumpParams{charSet}, $WIN->tfFilename->Text());
+	$dumpParams{filename} 	    =~ s/[\<\>\:\"\/\\\|\?\*\.]/_/g; # Remove invalid characters for Windows filename
+	$dumpParams{saveDir}   	    = encode($dumpParams{charSet}, $WIN->tfDirSave->Text());
+	chop($dumpParams{saveDir})  if $dumpParams{saveDir} =~ /\\$/;
+	$dumpParams{debugLogging}   = 1 if $CONFIG{'DEBUG_LOGGING'};
+	$dumpParams{timeToWait}     = $CONFIG{'TIME_TO_WAIT'};
+	$dumpParams{silentProgress} = 1 if $CONFIG{'SILENT_PROGRESS'} and !$now;
+	$dumpParams{delTempFiles}   = 1 if $CONFIG{'DEL_TEMP_FILES'};
+  $dumpParams{openReport}		  = 1 if $CONFIG{'OPEN_REPORT'} and ($now or !$CONFIG{'DONT_OPEN_REPORT'});
+  $dumpParams{startingURL}	  = $WIN->tfCurrURL->Text();
+	$dumpParams{incIcons}			  = $WIN->chProfileIcons->Checked();
+  $dumpParams{autoScroll}     = 1 if $WIN->chAutoScroll->Checked();
+	$dumpParams{reportFormat}	  = $WIN->cbFormat->GetString($WIN->cbFormat->GetCurSel());
+  $dumpParams{command}        = 'DumpItBlue-process ' . "$dumpParams{processName} $dumpParams{procID} \"$PROGDIR\" \"$USERDIR\"";
+  mkdir("$USERDIR\\Queue")  if !-d "$USERDIR\\Queue";
+	if (&createDumpDB("$USERDIR\\Queue\\$dumpParams{processName}-$dumpParams{procID}\.db", \%dumpParams)) {
+    if (!$now) { Win32::GUI::MessageBox($WIN, $STR{'addedQueue'}.'!', $STR{'Queue'}, 0x40040); } # Add to queue
+	}
+  exit(0);
+	
+}  #--- End dumpGroupMembers
+
+#--------------------------#
+sub validAlbumPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $caller, $updateFilename) = @_;
+  # $caller: 1 = Albums window, 2 = Contrib window, 2 = Comments window
+  my ($pageType, $goodAlbumUrl, $currTitle);
+  my $currURL = $$refMech->uri();
+  my $valid   = 0;
+  if ($currURL !~ /photos_albums/        and $currURL !~ /photos\?lst=[\w\%]+\&collection_token=\w+%\w+%3A6/ and
+			$currURL !~ /photos\/\?tab=albums/ and $currURL !~ /sk=photos\&collection_token=\w+%\w+%3A6/ and
+      $currURL !~ /photos\/\?filter=albums/) { # Not in the album page
+    return(0) if !$CONFIG{'AUTO_LOAD_SCROLL'} and $caller == 1; # Don't load and scroll automatically
+    # Determine type of page
+    ($pageType, $goodAlbumUrl) = &guessPageType($refMech, $currURL); # Page type: 0=unknown, 1=People, 2=Groups, 3=Pages (Business)
+    # Load the good Album page
+    ($currURL, $currTitle) = &loadPage($refMech, $goodAlbumUrl, $CONFIG{'TIME_TO_WAIT'}) if $pageType and $goodAlbumUrl;
+    $WIN->tfPageType->Text($pageType) if $pageType and $caller == 1;
+    # Re evaluate current page
+    if (($currURL !~ /photos_albums/        and $currURL !~ /photos_albums\?/         and $currURL !~ /collection_token=\w+%\w+%3A6/) and
+				 $currURL !~ /photos\/\?tab=albums/ and $currURL !~ /photos\/\?filter=albums/ or  $currTitle =~ /Page Not Found/) {  # Still not in the right page
+      if ($caller == 1) {
+        $WIN->btnDumpNow->Disable();
+        $WIN->btnAddQueue->Disable();
+      }
+      Win32::GUI::MessageBox($WIN, $STR{'warn3'}, $STR{'Warning'}, 0x40010);
+      threads->exit();
+    } else { # Now in the right page, scroll down to load the whole page
+      if ($pageType == 1) { &scrollAlbumPage($refMech, $CONFIG{'TIME_TO_WAIT'}); }
+      else                { &scrollPage($refMech, $CONFIG{'TIME_TO_WAIT'});      }
+      $$refMech->eval_in_page('window.scrollTo(0,0)') if $CONFIG{'OPT_SCROLL_TOP'};
+      $valid = 1;
+    }
+  # You are in the right page, scroll down to load the whole page
+  } else {
+    # Determine type of page
+    ($pageType, $goodAlbumUrl) = &guessPageType($refMech, $currURL); # Page type: 0=unknown, 1=People, 2=Groups, 3=Pages (Business)
+    $WIN->tfPageType->Text($pageType) if $pageType and $caller == 1;
+    # Get current page title
+    if ($currURL and $currURL =~ /https:\/\/(?:www|web).facebook.com\//) {
+      if    ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/) { $currTitle = $1; }
+			elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/groups\/([^\/\?]+)/        ) { $currTitle = $1; }
+      elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/                ) { $currTitle = $1; }
+    }
+    $WIN->lblInProgress->Text($STR{'loadAlbum'}.'...');
+    if ($CONFIG{'AUTO_LOAD_SCROLL'}) { # Scroll the page
+      if ($pageType == 1) { &scrollAlbumPage($refMech, $CONFIG{'TIME_TO_WAIT'}); }
+      else { &scrollPage($refMech, $CONFIG{'TIME_TO_WAIT'}); }
+    }
+    $$refMech->eval_in_page('window.scrollTo(0,0)') if $CONFIG{'OPT_SCROLL_TOP'};
+    $valid = 1;
+  }
+  # Write title
+  if ($valid and $currTitle and $updateFilename) {
+    chop($currTitle) if $currTitle =~ /#$/;
+    $currTitle .= " - Albums";
+    $WIN->tfFilename->Text($currTitle);
+  }
+  return($valid, $currURL);
+
+}  #--- End validAlbumPage
+
+#--------------------------#
+sub getListAlbums
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $refWinGrid, $pageType) = @_;
+  $WIN->lblInProgress->Text($STR{'gatherAlbums'}.'...');
+  my $tempDir = "$USERDIR\\temp";
+  mkdir("$tempDir") if !-d "$tempDir";
+  my $htmlPage = "$tempDir\\temp.html";
+	# Save the page
+	open(my $fhCurr, ">:encoding(utf8)", $htmlPage);
+	print $fhCurr $$refMech->content;
+	close($fhCurr);
+  # Load content from file
+  my $dom = new HTML::DOM(charset => 'utf8');
+  if ($dom->parse_file($htmlPage)) {
+    my @albumsCode;
+    if    ($pageType == 1 or $pageType == 2) { # People or Group
+      my $listCode = ($dom->getElementsByClassName('_2pip'))[0];
+      $listCode = ($dom->getElementsByClassName('fbPhotosAlbumsSection'))[0] if !$listCode;
+      @albumsCode = $listCode->getElementsByClassName('_51m-') if $listCode;
+    } elsif ($pageType == 3) {                 # Business
+      my $listCode = ($dom->getElementsByClassName('_2piq'))[0];
+      @albumsCode = $listCode->getElementsByClassName('_3rte');
+    }
+    my %tmpAlbums;
+    foreach my $albumCode (@albumsCode) {
+      my ($url, $name, $id);
+      my $linkNode = ($albumCode->getElementsByTagName('a'))[0];
+      $url = $linkNode->{href} if $linkNode;
+      if    ($url =~ /album_id=(\d+)/) { $id = $1; }
+      elsif ($url =~ /set=([^\&]+)/  ) { $id = $1; }
+      $url = "https://www.facebook.com$url" if $url !~ /^http/;
+      if ($pageType == 1 or $pageType == 3) { # People or Business
+        my $nameNode = ($albumCode->getElementsByClassName('_2iem'))[0];
+        $name = $nameNode->innerHTML if $nameNode;
+      } elsif ($pageType == 2) { # Group
+        if (my $nameNode = ($albumCode->getElementsByClassName('photoText'))[0]) {
+          if (my $nameCode = $nameNode->innerHTML) {
+            if ($nameCode =~ /<strong>(.+?)<\/strong>/) { $name = $1; }
+          }
+        }
+      }
+      if ($url and $name and $id) {
+        $url =~ s/&amp;/&/g;
+        $tmpAlbums{$id}{name} = encode($CONFIG{'CHARSET'}, $name);
+        $tmpAlbums{$id}{url}  = $url;
+      }
+    }
+    # Feed the grid
+    foreach my $id (keys %tmpAlbums) {
+      if (my $i = $$refWinGrid->InsertRow($tmpAlbums{$id}{name}, -1)) {
+        $$refWinGrid->SetCellText($i, 0, ''        );
+        $$refWinGrid->SetCellType($i, 0, GVIT_CHECK);
+        $$refWinGrid->SetCellCheck($i, 0, 1);
+        $$refWinGrid->SetCellText($i, 1, $tmpAlbums{$id}{name});
+        $$refWinGrid->SetCellText($i, 2, $id                  );
+        $$refWinGrid->SetCellText($i, 3, $tmpAlbums{$id}{url} );
+        $$refWinGrid->Refresh();
+      }
+    }
+  }
+  
+}  #--- End getListAlbums
+
+#--------------------------#
+sub getSelAlbums
+#--------------------------#
+{
+  my ($refAlbums) = @_;
+  for (my $i = 1; $i < $WIN->GridAlbums->GetRows(); $i++) {
+    if ($WIN->GridAlbums->GetCellCheck($i, 0)) {
+      my $albumId = $WIN->GridAlbums->GetCellText($i, 2);
+      $$refAlbums{$albumId}{name} = $WIN->GridAlbums->GetCellText($i, 1);
+      $$refAlbums{$albumId}{url}  = $WIN->GridAlbums->GetCellText($i, 3);
+    }
+  }
+  
+}  #--- End getSelAlbums
+
+#--------------------------#
+sub guessPageType
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $currURL) = @_;
+  my $pageType = 0; # 0 = unknown, 1 = People, 2 = Groups, 3 = Pages (Business)
+  my $goodAlbumUrl;
+  # Trying to get the good page
+  if      ($currURL =~ /https:\/\/(?:www|web).facebook.com\/groups\/([^\/]+)/ ) { # Album from a Group page (public)
+    $goodAlbumUrl = "https://www.facebook.com/groups/$1/photos/?filter=albums";
+    $pageType     = 2;
+  } elsif  ($currURL =~ /https:\/\/(?:www|web).facebook.com\/pg\/([^\/]+)/    ) { # Page (Business)
+    $goodAlbumUrl = "https://www.facebook.com/$1/photos/?tab=albums";
+    $pageType     = 3;
+  } elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/ ) { # People: Profile with id
+    $goodAlbumUrl = "https://www.facebook.com/profile.php?id=$1&sk=photos&collection_token=$1%3A2305272732%3A6";
+    $pageType     = 1;
+  } elsif ($currURL =~ /(?:\?lst=\d+%3A\d+%3A\d+|\?collection_token=\d+)/ and
+                         $currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\?\/]+)/) { # People: Profile with id
+    $goodAlbumUrl = "https://www.facebook.com/$1/photos_albums";
+    $pageType     = 1;
+  } elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/]+)/) { # People - Other or Pages
+    my $searchTag = $$refMech->selector('a._2wmb', any => 1); # The search tag is specific to Pages (ex.: @businessName)
+    if ($searchTag) { $goodAlbumUrl = "https://www.facebook.com/$1/photos/?tab=albums"; $pageType = 3; } # Page (Business)
+    else            { $goodAlbumUrl = "https://www.facebook.com/$1/photos_albums";      $pageType = 1; } # People
+  }
+  return($pageType, $goodAlbumUrl);
+  
+}  #--- End guessPageType
+
+#--------------------------#
+sub scrollAlbumPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $time) = @_;
+  while (1) {
+    sleep($time); # End of the page ?
+    my @parts = $$refMech->selector('div._30f');
+    if (scalar(@parts) > 1) { return(1); } # End of the page
+    else { # Scrolling down and wait for content to load
+      $$refMech->eval_in_page('window.scrollTo(0,document.body.scrollHeight)');
+      sleep($time);
+    }
+  }
+
+}  #--- End scrollAlbumPage
+
+#--------------------------#
+sub createDumpDB
+#--------------------------#
+{
+  # Local variables
+  my ($dbFile, $refInfos) = @_;
+  my $dsn = "DBI:SQLite:dbname=$dbFile";
+  my $dbh = DBI->connect($dsn, undef, undef, { AutoCommit => 1, sqlite_unicode => 1}) or return(0);
+  # Create Infos table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS INFOS
+                (key            VARCHAR(255)  NOT NULL,
+                 value          INT,
+                 PRIMARY KEY (key)));
+  my $rv = $dbh->do($stmt);
+  return(0) if $rv < 0;
+  # Insert all parameters
+  my $sthUptInfos = $dbh->prepare('INSERT OR REPLACE INTO INFOS (key, value) VALUES(?,?)');
+  foreach my $key (keys %{$refInfos}) { $sthUptInfos->execute($key, $$refInfos{$key}); }
+  $sthUptInfos->finish();
+  undef $dbh;
+  return(1);
+  
+}  #--- End createDumpDB
+
+#--------------------------#
+sub createAlbumsDB
+#--------------------------#
+{
+  # Local variables
+  my ($dbFile, $refAlbums) = @_;
+  my $dsn = "DBI:SQLite:dbname=$dbFile";
+  my $dbh = DBI->connect($dsn, undef, undef, { AutoCommit => 0, sqlite_unicode => 1}) or return(0);
+  # Create Infos table
+  my $stmt = qq(CREATE TABLE IF NOT EXISTS ALBUMS
+                (id           VARCHAR(255)  NOT NULL,
+                 name         VARCHAR(255)  NOT NULL,
+                 url          VARCHAR(255)  NOT NULL,
+                 tmpPage      VARCHAR(255),
+                 path         VARCHAR(255),
+                 step         INT,
+                 PRIMARY KEY (id)));
+  my $rv = $dbh->do($stmt);
+  return(0) if $rv < 0;
+  # Insert all parameters
+  my $sthUptAlbums = $dbh->prepare('INSERT OR REPLACE INTO ALBUMS (id, name, url) VALUES(?,?,?)');
+  foreach my $albumId (keys %{$refAlbums}) { $sthUptAlbums->execute($albumId, $$refAlbums{$albumId}{name}, $$refAlbums{$albumId}{url}); }
+  $sthUptAlbums->finish();
+  $dbh->commit();
+  undef $dbh;
+  return(1);
+  
+}  #--- End createAlbumsDB
+
+#--------------------------#
+sub loadPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $url, $timeToWait) = @_;
+  $$refMech->get($url);
+  sleep($timeToWait);
+  my $currURL = $$refMech->uri();
+  my $currTitle;
+  if ($currURL and $currURL =~ /https:\/\/(?:www|web).facebook.com\//) {
+    if    ($currURL =~ /https:\/\/(?:www|web).facebook.com\/profile.php\?id=([^\/\&]+)/) { $currTitle = $1; }
+    elsif ($currURL =~ /https:\/\/(?:www|web).facebook.com\/([^\/\?]+)/                ) { $currTitle = $1; }
+  }
+  return($currURL, $currTitle);
+
+}  #--- End loadPage
+
+#--------------------------#
+sub formatDate
+#--------------------------#
+{
+  # Local variables
+  my $unixtime = shift;
+  # Convert to string, local timezone
+  if ($unixtime =~ /\./) { $unixtime = (split(/\./, $unixtime))[0]; }
+  my ($s,$min,$hr,$d,$m,$y,$weekday,$ha,$isDST) = localtime($unixtime);
+	return(sprintf("%04d\-%02d\-%02d %02d:%02d:%02d", $y+1900, $m+1, $d, $hr, $min, $s));
+
+}  #--- End formatDate
+
+#--------------------------#
+sub scrollPage
+#--------------------------#
+{
+  # Local variables
+  my ($refMech, $time) = @_;
+  my $count = 0;
+  my ($offSet, $type) = $$refMech->eval_in_page('document.body.offsetHeight');
+  while ($count < 3) {
+    $$refMech->eval_in_page('if (document.body) { window.scrollTo(0,document.body.scrollHeight); } ');
+    sleep($time);
+    my ($lastOffSet, $type2) = $$refMech->eval_in_page('document.body.offsetHeight');
+    if ($lastOffSet == $offSet) { $count++; }
+    else { $count = 0; }
+    $offSet = $lastOffSet;
+  }
+
+}  #--- End scrollPage
+
+#--------------------------#
+sub exploreDir
+#--------------------------#
+{
+	# Open Window Explorer
+	my $dir = shift;
+  Win32::Process::Create(my $ProcessObj, "$ENV{'WINDIR'}\\explorer.exe", "explorer $dir", 0, NORMAL_PRIORITY_CLASS, ".") if $dir and -d $dir;
+	
+}  #--- End exploreDir
+
+#--------------------------#
+sub debug
+#--------------------------#
+{
+  # Local variables
+  my ($refMsg) = @_;
+  my $dateStr  = &formatDate(time);
+  $refMsg      = decode_entities($refMsg);
+  # Save error msg in debug log file
+	my $fhLog;
+  if (-e $DEBUG_FILE) { open($fhLog,">>$DEBUG_FILE"); }
+  else                { open($fhLog,">$DEBUG_FILE");  }
+  flock($fhLog, 2);
+  print $fhLog "$dateStr\t[DumpItBlue-Load.exe]\t$refMsg\n";
+  close($fhLog);  
+
+}  #--- End debug
+
+#--------------------------#
+sub rememberPosWin
+#--------------------------#
+{
+	# Remember position
+  my $winLeft = $WIN->AbsLeft();
+  my $winTop  = $WIN->AbsTop();
+  $CONFIG{uc($TYPEDUMP).'_LEFT'} = $winLeft;
+  $CONFIG{uc($TYPEDUMP).'_TOP'}  = $winTop;
+  &saveConfig();
+  
+}  #--- End rememberPosWin
+
+#--------------------------#
+sub saveConfig
+#--------------------------#
+{
+  # Save configuration hash values
+  open(CONFIG,">$CONFIG_FILE");
+  flock(CONFIG, 2);
+  foreach my $cle (keys %CONFIG) { print CONFIG "$cle = $CONFIG{$cle}\n"; }
+  close(CONFIG);  
+
+}  #--- End saveConfig
+
+#--------------------------#
+sub loadConfig
+#--------------------------#
+{
+  # If ini file exists
+  if (-T $CONFIG_FILE) {
+    # Open and load config values
+    open(CONFIG, $CONFIG_FILE);
+    my @tab = <CONFIG>;
+    close(CONFIG);
+    foreach (@tab) {
+      chomp($_);
+      my ($key, $value) = split(/ = /, $_);
+      $CONFIG{$key}     = $value if $key;
+    }
+  }
+  # Load default values
+  if (exists($CONFIG{uc($TYPEDUMP).'_REPORT_FORMAT'})) { $WIN->cbFormat->SetCurSel($CONFIG{uc($TYPEDUMP).'_REPORT_FORMAT'}); }
+  else 																				         { $WIN->cbFormat->SetCurSel(1); 														    	     } # Default is HTML
+  $WIN->tfDirSave->Text($CONFIG{uc($TYPEDUMP).'_DIR_SAVE'})	if exists($CONFIG{uc($TYPEDUMP).'_DIR_SAVE'}) and -d $CONFIG{uc($TYPEDUMP).'_DIR_SAVE'};
+  if (exists($CONFIG{'INCLUDE_ICONS'})) { $WIN->chProfileIcons->Checked($CONFIG{'INCLUDE_ICONS'});        }
+  else                                  { $WIN->chProfileIcons->Checked(0); $CONFIG{'INCLUDE_ICONS'} = 0; } # Default is not checked
+  if (exists($CONFIG{'AUTOSCROLL'})   ) { $WIN->chAutoScroll->Checked($CONFIG{'AUTOSCROLL'});             }
+  else                                  { $WIN->chAutoScroll->Checked(0); $CONFIG{'AUTOSCROLL'} = 0;      } # Default is not checked
+  if ($TYPEDUMP eq 'Albums') { # Dump Albums
+    if (exists($CONFIG{'ALBUMS_OPEN_DIR'})) { $WIN->chAlbumsOpenDir->Checked($CONFIG{'ALBUMS_OPEN_DIR'});				 }
+    else                                    { $WIN->chAlbumsOpenDir->Checked(0); $CONFIG{'ALBUMS_OPEN_DIR'} = 0; } # Default is not checked
+  }
+
+}  #--- End loadConfig
+
+#------------------------------------------------------------------------------#
